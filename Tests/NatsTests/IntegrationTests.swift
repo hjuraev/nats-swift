@@ -995,7 +995,7 @@ struct IntegrationTests {
                 #expect(await client.isConnected)
                 clients.append(client)
                 // Small delay to avoid overwhelming the server with rapid TLS handshakes
-                try await Task.sleep(for: .milliseconds(50))
+                try await Task.sleep(for: .milliseconds(150))
             }
 
             // All clients should be connected
