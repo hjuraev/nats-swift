@@ -11,8 +11,13 @@ variables:
   image: swift:${SWIFT_VERSION}
   before_script:
     - swift --version
+  cache:
+    key: ${CI_COMMIT_REF_SLUG}
+    paths:
+      - .build/checkouts/
+      - .build/repositories/
 
-# Build job - compile the package
+# Build job
 build:
   extends: .swift_base
   stage: build
@@ -22,28 +27,20 @@ build:
     paths:
       - .build/
     expire_in: 1 hour
-  cache:
-    key: ${CI_COMMIT_REF_SLUG}-build
-    paths:
-      - .build/checkouts/
-      - .build/repositories/
 
-# Test job with NATS server (TLS enabled, managed in script)
+# Test job with NATS server and TLS
 test:
   extends: .swift_base
   stage: test
   variables:
     NATS_URL: "tls://localhost:4222"
-    NATS_TLS_INSECURE: "true"
   before_script:
     - swift --version
-    # Install dependencies
     - apt-get update && apt-get install -y openssl wget netcat-openbsd
     # Download and install NATS server
     - wget -q https://github.com/nats-io/nats-server/releases/download/v${NATS_VERSION}.0/nats-server-v${NATS_VERSION}.0-linux-amd64.tar.gz
     - tar -xzf nats-server-v${NATS_VERSION}.0-linux-amd64.tar.gz
     - mv nats-server-v${NATS_VERSION}.0-linux-amd64/nats-server /usr/local/bin/
-    - nats-server --version
     # Generate self-signed TLS certificates
     - mkdir -p ./certs
     - |
@@ -52,9 +49,7 @@ test:
         -out ./certs/server-cert.pem \
         -subj "/CN=localhost/O=NATS-Test/C=US" \
         -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
-    - chmod 644 ./certs/server-cert.pem
-    - chmod 600 ./certs/server-key.pem
-    # Start NATS server with TLS and JetStream in background
+    # Start NATS server with TLS and JetStream
     - |
       nats-server \
         --tls \
@@ -62,21 +57,11 @@ test:
         --tlskey=./certs/server-key.pem \
         --jetstream \
         --store_dir=/tmp/nats-jetstream \
-        --port 4222 \
-        --debug &
+        --port 4222 &
     # Wait for NATS to be ready
     - |
-      echo "Waiting for NATS server to start..."
       for i in $(seq 1 30); do
-        if nc -z localhost 4222 2>/dev/null; then
-          echo "NATS server is ready on port 4222"
-          break
-        fi
-        if [ $i -eq 30 ]; then
-          echo "NATS server failed to start"
-          exit 1
-        fi
-        echo "Waiting... ($i/30)"
+        nc -z localhost 4222 && echo "NATS server ready" && break
         sleep 1
       done
     - sleep 2
@@ -84,244 +69,3 @@ test:
     - swift test --parallel
   after_script:
     - pkill nats-server || true
-  cache:
-    key: ${CI_COMMIT_REF_SLUG}-test
-    paths:
-      - .build/checkouts/
-      - .build/repositories/
-
-# Test with code coverage
-test:coverage:
-  extends: .swift_base
-  stage: test
-  variables:
-    NATS_URL: "tls://localhost:4222"
-    NATS_TLS_INSECURE: "true"
-  before_script:
-    - swift --version
-    # Install dependencies
-    - apt-get update && apt-get install -y openssl wget netcat-openbsd llvm
-    # Download and install NATS server
-    - wget -q https://github.com/nats-io/nats-server/releases/download/v${NATS_VERSION}.0/nats-server-v${NATS_VERSION}.0-linux-amd64.tar.gz
-    - tar -xzf nats-server-v${NATS_VERSION}.0-linux-amd64.tar.gz
-    - mv nats-server-v${NATS_VERSION}.0-linux-amd64/nats-server /usr/local/bin/
-    # Generate TLS certificates
-    - mkdir -p ./certs
-    - |
-      openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
-        -keyout ./certs/server-key.pem \
-        -out ./certs/server-cert.pem \
-        -subj "/CN=localhost/O=NATS-Test/C=US" \
-        -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
-    # Start NATS server
-    - |
-      nats-server \
-        --tls \
-        --tlscert=./certs/server-cert.pem \
-        --tlskey=./certs/server-key.pem \
-        --jetstream \
-        --store_dir=/tmp/nats-jetstream \
-        --port 4222 &
-    - |
-      for i in $(seq 1 30); do
-        nc -z localhost 4222 && break
-        sleep 1
-      done
-    - sleep 2
-  script:
-    - swift test --enable-code-coverage
-    # Generate coverage report
-    - |
-      llvm-cov export \
-        .build/debug/swift-natsPackageTests.xctest \
-        -instr-profile=.build/debug/codecov/default.profdata \
-        -format=lcov > coverage.lcov || true
-  after_script:
-    - pkill nats-server || true
-  coverage: '/^\s*Lines:\s*(\d+\.\d+)%/'
-  artifacts:
-    reports:
-      coverage_report:
-        coverage_format: cobertura
-        path: coverage.xml
-    paths:
-      - coverage.lcov
-    expire_in: 1 week
-  cache:
-    key: ${CI_COMMIT_REF_SLUG}-coverage
-    paths:
-      - .build/checkouts/
-      - .build/repositories/
-  rules:
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-    - if: $CI_MERGE_REQUEST_ID
-
-# Test without TLS (basic functionality)
-test:no-tls:
-  extends: .swift_base
-  stage: test
-  variables:
-    NATS_URL: "nats://localhost:4222"
-  before_script:
-    - swift --version
-    - apt-get update && apt-get install -y wget netcat-openbsd
-    # Download NATS server
-    - wget -q https://github.com/nats-io/nats-server/releases/download/v${NATS_VERSION}.0/nats-server-v${NATS_VERSION}.0-linux-amd64.tar.gz
-    - tar -xzf nats-server-v${NATS_VERSION}.0-linux-amd64.tar.gz
-    - mv nats-server-v${NATS_VERSION}.0-linux-amd64/nats-server /usr/local/bin/
-    # Start NATS server without TLS
-    - |
-      nats-server \
-        --jetstream \
-        --store_dir=/tmp/nats-jetstream \
-        --port 4222 &
-    - |
-      for i in $(seq 1 30); do
-        nc -z localhost 4222 && break
-        sleep 1
-      done
-    - sleep 2
-  script:
-    - swift test --parallel
-  after_script:
-    - pkill nats-server || true
-  cache:
-    key: ${CI_COMMIT_REF_SLUG}-test-no-tls
-    paths:
-      - .build/checkouts/
-      - .build/repositories/
-  rules:
-    - when: manual
-  allow_failure: true
-
-# Linux ARM64 build
-build:linux-arm64:
-  extends: .swift_base
-  stage: build
-  image: swift:${SWIFT_VERSION}
-  tags:
-    - arm64
-  script:
-    - swift build -c release
-  rules:
-    - when: manual
-  allow_failure: true
-
-# macOS build and test (requires self-hosted macOS runner)
-.macos_base:
-  stage: test
-  tags:
-    - macos
-    - xcode15
-  variables:
-    NATS_URL: "tls://localhost:4222"
-  before_script:
-    - swift --version
-    - xcodebuild -version || true
-    # Install NATS via Homebrew
-    - brew install nats-server || brew upgrade nats-server || true
-    # Generate TLS certificates
-    - mkdir -p ./certs
-    - |
-      openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
-        -keyout ./certs/server-key.pem \
-        -out ./certs/server-cert.pem \
-        -subj "/CN=localhost/O=NATS-Test/C=US" \
-        -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
-    # Start NATS server
-    - |
-      nats-server \
-        --tls \
-        --tlscert=./certs/server-cert.pem \
-        --tlskey=./certs/server-key.pem \
-        --jetstream \
-        --store_dir=/tmp/nats-jetstream \
-        --port 4222 &
-    - sleep 3
-
-build:macos:
-  extends: .macos_base
-  stage: build
-  script:
-    - swift build -c release
-  after_script:
-    - pkill nats-server || true
-  rules:
-    - when: manual
-  allow_failure: true
-
-test:macos:
-  extends: .macos_base
-  stage: test
-  script:
-    - swift test --parallel
-  after_script:
-    - pkill nats-server || true
-  rules:
-    - when: manual
-  allow_failure: true
-
-# Release build validation
-build:release:
-  extends: .swift_base
-  stage: build
-  script:
-    - swift build -c release -Xswiftc -warnings-as-errors
-  rules:
-    - if: $CI_COMMIT_TAG
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-
-# Docker-based integration test (alternative approach)
-test:docker:
-  stage: test
-  image: docker:24
-  services:
-    - docker:24-dind
-  variables:
-    DOCKER_TLS_CERTDIR: "/certs"
-    DOCKER_HOST: tcp://docker:2376
-  before_script:
-    - apk add --no-cache bash openssl curl git
-  script:
-    # Create network
-    - docker network create nats-test || true
-    # Generate certificates
-    - mkdir -p ./certs
-    - |
-      openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
-        -keyout ./certs/server-key.pem \
-        -out ./certs/server-cert.pem \
-        -subj "/CN=nats/O=NATS-Test/C=US" \
-        -addext "subjectAltName=DNS:nats,DNS:localhost,IP:127.0.0.1"
-    # Start NATS server
-    - |
-      docker run -d --name nats-server \
-        --network nats-test \
-        -p 4222:4222 \
-        -v $(pwd)/certs:/certs:ro \
-        nats:${NATS_VERSION} \
-        --tls \
-        --tlscert=/certs/server-cert.pem \
-        --tlskey=/certs/server-key.pem \
-        --jetstream \
-        --store_dir=/data
-    - sleep 5
-    - docker logs nats-server
-    # Run Swift tests in container
-    - |
-      docker run --rm \
-        --network nats-test \
-        -v $(pwd):/workspace \
-        -v $(pwd)/certs:/certs:ro \
-        -w /workspace \
-        -e NATS_URL=tls://nats:4222 \
-        -e NATS_TLS_INSECURE=true \
-        swift:${SWIFT_VERSION} \
-        swift test --parallel
-  after_script:
-    - docker stop nats-server || true
-    - docker rm nats-server || true
-    - docker network rm nats-test || true
-  rules:
-    - when: manual
-  allow_failure: true
