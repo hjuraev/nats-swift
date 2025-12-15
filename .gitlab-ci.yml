@@ -3,8 +3,8 @@ stages:
   - test
 
 variables:
-  SWIFT_VERSION: "6.0"
-  NATS_VERSION: "2.10"
+  SWIFT_VERSION: "6.2"
+  NATS_VERSION: "2.12"
 
 # Base template for Swift jobs
 .swift_base:
