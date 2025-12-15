@@ -2,7 +2,7 @@ stages:
   - test
 
 variables:
-  SWIFT_VERSION: "6.0"
+  SWIFT_VERSION: "6.2"
   NATS_VERSION: "2.10"
 
 # Test job with NATS server and TLS
