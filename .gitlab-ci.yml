@@ -1,39 +1,20 @@
 stages:
-  - build
   - test
 
 variables:
-  SWIFT_VERSION: "6.2"
-  NATS_VERSION: "2.12"
-
-# Base template for Swift jobs
-.swift_base:
-  image: swift:${SWIFT_VERSION}
-  before_script:
-    - swift --version
-  cache:
-    key: ${CI_COMMIT_REF_SLUG}
-    paths:
-      - .build/checkouts/
-      - .build/repositories/
-
-# Build job
-build:
-  extends: .swift_base
-  stage: build
-  script:
-    - swift build -c release
-  artifacts:
-    paths:
-      - .build/
-    expire_in: 1 hour
+  SWIFT_VERSION: "6.0"
+  NATS_VERSION: "2.10"
 
 # Test job with NATS server and TLS
 test:
-  extends: .swift_base
+  image: swift:${SWIFT_VERSION}
   stage: test
   variables:
     NATS_URL: "tls://localhost:4222"
+  cache:
+    key: ${CI_COMMIT_REF_SLUG}
+    paths:
+      - .build/
   before_script:
     - swift --version
     - apt-get update && apt-get install -y openssl wget netcat-openbsd
@@ -66,6 +47,7 @@ test:
       done
     - sleep 2
   script:
+    - swift build
     - swift test --parallel
   after_script:
     - pkill nats-server || true
