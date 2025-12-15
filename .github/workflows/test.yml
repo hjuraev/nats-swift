@@ -47,7 +47,6 @@ jobs:
           nats-server \
             --tlscert=./certs/server-cert.pem \
             --tlskey=./certs/server-key.pem \
-            --allow_non_tls \
             --jetstream \
             --store_dir=/tmp/nats-jetstream \
             --port 4222 &

@@ -30,12 +30,11 @@ test:
         -out ./certs/server-cert.pem \
         -subj "/CN=localhost/O=NATS-Test/C=US" \
         -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
-    # Start NATS server with TLS support (but allowing non-TLS) and JetStream
+    # Start NATS server with TLS available (but not required) and JetStream
     - |
       nats-server \
         --tlscert=./certs/server-cert.pem \
         --tlskey=./certs/server-key.pem \
-        --allow_non_tls \
         --jetstream \
         --store_dir=/tmp/nats-jetstream \
         --port 4222 &
