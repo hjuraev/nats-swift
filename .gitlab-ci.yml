@@ -48,6 +48,6 @@ test:
     - sleep 2
   script:
     - swift build
-    - swift test --parallel
+    - swift test
   after_script:
     - pkill nats-server || true
