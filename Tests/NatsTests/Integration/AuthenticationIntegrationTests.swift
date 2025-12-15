@@ -54,6 +54,7 @@ struct AuthenticationIntegrationTests {
         let client = NatsClient {
             $0.servers = [URL(string: "nats://localhost:4223")!]
             $0.auth = .token("wrong-token")
+            $0.reconnect = .disabled  // Disable reconnection to ensure auth failure is thrown
         }
 
         do {
@@ -119,6 +120,7 @@ struct AuthenticationIntegrationTests {
         let client = NatsClient {
             $0.servers = [URL(string: "nats://localhost:4224")!]
             $0.auth = .userPass(user: "admin", password: "wrongpassword")
+            $0.reconnect = .disabled  // Disable reconnection to ensure auth failure is thrown
         }
 
         do {
@@ -147,6 +149,7 @@ struct AuthenticationIntegrationTests {
         let client = NatsClient {
             $0.servers = [URL(string: "nats://localhost:4224")!]
             $0.auth = .userPass(user: "wronguser", password: "password123")
+            $0.reconnect = .disabled  // Disable reconnection to ensure auth failure is thrown
         }
 
         do {
