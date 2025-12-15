@@ -51,5 +51,31 @@ jobs:
       - name: Build
         run: swift build
 
-      - name: Run Tests
-        run: swift test
+      - name: Run Tests with Coverage
+        run: swift test --enable-code-coverage
+
+      - name: Generate Coverage Report
+        run: |
+          BIN_PATH=$(swift build --show-bin-path)
+          XCTEST_PATH=$(find ${BIN_PATH} -name '*.xctest' -type d | head -1)
+          COV_BIN="${XCTEST_PATH}/Contents/MacOS/$(basename ${XCTEST_PATH} .xctest)" || COV_BIN="${BIN_PATH}/NatsPackageTests.xctest"
+
+          # For Linux, the binary is directly in .build
+          if [ -f "${BIN_PATH}/NatsPackageTests.xctest" ]; then
+            COV_BIN="${BIN_PATH}/NatsPackageTests.xctest"
+          fi
+
+          llvm-cov export \
+            -instr-profile=.build/debug/codecov/default.profdata \
+            -ignore-filename-regex=".build|Tests" \
+            -format=lcov \
+            ${COV_BIN} > coverage.lcov
+
+      - name: Upload Coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: coverage.lcov
+          fail_ci_if_error: false
+          verbose: true
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}

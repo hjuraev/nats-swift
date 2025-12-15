@@ -6,6 +6,7 @@ A modern, high-performance NATS client for Swift 6.0 with full JetStream support
 [![Platform](https://img.shields.io/badge/Platform-macOS%20|%20iOS%20|%20Linux-blue.svg)](https://swift.org)
 [![License](https://img.shields.io/badge/License-Apache%202.0-green.svg)](LICENSE)
 [![Test](https://github.com/hjuraev/nats-swift/actions/workflows/test.yml/badge.svg)](https://github.com/hjuraev/nats-swift/actions/workflows/test.yml)
+[![codecov](https://codecov.io/gh/hjuraev/nats-swift/graph/badge.svg)](https://codecov.io/gh/hjuraev/nats-swift)
 
 ## Overview
 
