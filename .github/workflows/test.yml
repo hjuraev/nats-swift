@@ -57,13 +57,22 @@ jobs:
       - name: Generate Coverage Report
         run: |
           BIN_PATH=$(swift build --show-bin-path)
-          XCTEST_PATH=$(find ${BIN_PATH} -name '*.xctest' -type d | head -1)
-          COV_BIN="${XCTEST_PATH}/Contents/MacOS/$(basename ${XCTEST_PATH} .xctest)" || COV_BIN="${BIN_PATH}/NatsPackageTests.xctest"
 
-          # For Linux, the binary is directly in .build
-          if [ -f "${BIN_PATH}/NatsPackageTests.xctest" ]; then
+          # On Linux, find the test executable
+          COV_BIN=$(find ${BIN_PATH} -name 'NatsPackageTests' -type f -executable 2>/dev/null | head -1)
+
+          # Fallback: try common patterns
+          if [ -z "$COV_BIN" ] || [ ! -f "$COV_BIN" ]; then
             COV_BIN="${BIN_PATH}/NatsPackageTests.xctest"
           fi
+
+          if [ ! -f "$COV_BIN" ]; then
+            echo "Looking for test binary..."
+            find ${BIN_PATH} -type f -executable | head -20
+            COV_BIN=$(find ${BIN_PATH} -type f -executable -name '*Tests*' | head -1)
+          fi
+
+          echo "Using coverage binary: $COV_BIN"
 
           llvm-cov export \
             -instr-profile=.build/debug/codecov/default.profdata \
