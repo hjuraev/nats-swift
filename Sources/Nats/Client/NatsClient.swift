@@ -150,7 +150,7 @@ public actor NatsClient {
     /// Publish a message to a subject
     public func publish(
         _ subject: String,
-        payload: Data = Data(),
+        payload: ByteBuffer = ByteBuffer(),
         headers: NatsHeaders? = nil
     ) async throws(ProtocolError) {
         try Subject.validateForPublish(subject)
@@ -159,9 +159,8 @@ public actor NatsClient {
             throw .serverError("Not connected")
         }
 
-        let buffer = payload.toByteBuffer()
         do {
-            try await write(.publish(subject: subject, reply: nil, headers: headers, payload: buffer))
+            try await write(.publish(subject: subject, reply: nil, headers: headers, payload: payload))
         } catch {
             throw .serverError("Write failed: \(error)")
         }
@@ -171,7 +170,7 @@ public actor NatsClient {
     /// Publish a message with a reply subject
     public func publish(
         _ subject: String,
-        payload: Data,
+        payload: ByteBuffer,
         reply: String
     ) async throws(ProtocolError) {
         try Subject.validateForPublish(subject)
@@ -181,9 +180,8 @@ public actor NatsClient {
             throw .serverError("Not connected")
         }
 
-        let buffer = payload.toByteBuffer()
         do {
-            try await write(.publish(subject: subject, reply: reply, headers: nil, payload: buffer))
+            try await write(.publish(subject: subject, reply: reply, headers: nil, payload: payload))
         } catch {
             throw .serverError("Write failed: \(error)")
         }
@@ -195,7 +193,7 @@ public actor NatsClient {
     /// Send a request and wait for a response
     public func request(
         _ subject: String,
-        payload: Data = Data(),
+        payload: ByteBuffer = ByteBuffer(),
         timeout: Duration? = nil
     ) async throws -> NatsMessage {
         try Subject.validateForPublish(subject)
@@ -216,9 +214,8 @@ public actor NatsClient {
                 await self.storePendingRequest(replySubject: replySubject, continuation: continuation)
 
                 // Publish request
-                let buffer = payload.toByteBuffer()
                 do {
-                    try await self.write(.publish(subject: subject, reply: replySubject, headers: nil, payload: buffer))
+                    try await self.write(.publish(subject: subject, reply: replySubject, headers: nil, payload: payload))
                     self._messagesSent.wrappingAdd(1, ordering: .relaxed)
                 } catch {
                     await self.removePendingRequest(replySubject: replySubject)

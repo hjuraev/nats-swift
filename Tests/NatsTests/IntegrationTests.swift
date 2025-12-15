@@ -4,7 +4,26 @@
 
 import Testing
 import Foundation
+import NIOCore
 @testable import Nats
+
+// MARK: - Test Helper Extension
+
+extension ByteBuffer {
+    /// Create a ByteBuffer from a string for testing convenience
+    static func from(_ string: String) -> ByteBuffer {
+        var buffer = ByteBuffer()
+        buffer.writeString(string)
+        return buffer
+    }
+
+    /// Create a ByteBuffer from data for testing convenience
+    static func from(_ data: Data) -> ByteBuffer {
+        var buffer = ByteBuffer()
+        buffer.writeBytes(data)
+        return buffer
+    }
+}
 
 /// Integration tests requiring a running NATS server on localhost:4222
 @Suite("Integration Tests", .tags(.integration))
@@ -94,7 +113,7 @@ struct IntegrationTests {
             let subscription = try await client.subscribe(subject)
 
             // Publish message
-            try await client.publish(subject, payload: Data(testMessage.utf8))
+            try await client.publish(subject, payload: ByteBuffer.from(testMessage))
 
             // Receive message with timeout
             var receivedMessage: NatsMessage?
@@ -122,8 +141,8 @@ struct IntegrationTests {
             let subscription = try await client.subscribe("\(baseSubject).*")
 
             // Publish to different subjects
-            try await client.publish("\(baseSubject).one", payload: Data("first".utf8))
-            try await client.publish("\(baseSubject).two", payload: Data("second".utf8))
+            try await client.publish("\(baseSubject).one", payload: ByteBuffer.from("first"))
+            try await client.publish("\(baseSubject).two", payload: ByteBuffer.from("second"))
 
             var messages: [NatsMessage] = []
             var count = 0
@@ -149,9 +168,9 @@ struct IntegrationTests {
             let baseSubject = "test.gt.\(UUID().uuidString)"
             let subscription = try await client.subscribe("\(baseSubject).>")
 
-            try await client.publish("\(baseSubject).a", payload: Data("1".utf8))
-            try await client.publish("\(baseSubject).a.b", payload: Data("2".utf8))
-            try await client.publish("\(baseSubject).a.b.c", payload: Data("3".utf8))
+            try await client.publish("\(baseSubject).a", payload: ByteBuffer.from("1"))
+            try await client.publish("\(baseSubject).a.b", payload: ByteBuffer.from("2"))
+            try await client.publish("\(baseSubject).a.b.c", payload: ByteBuffer.from("3"))
 
             var messages: [NatsMessage] = []
             var count = 0
@@ -179,7 +198,7 @@ struct IntegrationTests {
             let sub1 = try await client.subscribe(subject)
             let sub2 = try await client.subscribe(subject)
 
-            try await client.publish(subject, payload: Data("test".utf8))
+            try await client.publish(subject, payload: ByteBuffer.from("test"))
 
             // Both subscribers should receive the message
             var msg1: NatsMessage?
@@ -219,7 +238,7 @@ struct IntegrationTests {
 
             let subscription = try await client.subscribe(subject)
 
-            try await client.publish(subject, payload: Data("with headers".utf8), headers: headers)
+            try await client.publish(subject, payload: ByteBuffer.from("with headers"), headers: headers)
 
             var receivedMessage: NatsMessage?
             for await message in subscription {
@@ -244,7 +263,8 @@ struct IntegrationTests {
 
             let subject = "test.large.\(UUID().uuidString)"
             // 100KB payload
-            let largeData = Data(repeating: 0x42, count: 100_000)
+            var largeData = ByteBuffer()
+            largeData.writeRepeatingByte(0x42, count: 100_000)
 
             let subscription = try await client.subscribe(subject)
 
@@ -257,7 +277,7 @@ struct IntegrationTests {
             }
 
             #expect(receivedMessage != nil)
-            #expect(receivedMessage?.payload.count == 100_000)
+            #expect(receivedMessage?.payload.readableBytes == 100_000)
 
             await subscription.unsubscribe()
             await client.close()
@@ -274,7 +294,7 @@ struct IntegrationTests {
 
             let subscription = try await client.subscribe(subject)
 
-            try await client.publish(subject, payload: Data())
+            try await client.publish(subject, payload: ByteBuffer())
 
             var receivedMessage: NatsMessage?
             for await message in subscription {
@@ -305,7 +325,7 @@ struct IntegrationTests {
 
             // Publish multiple messages
             for i in 1...10 {
-                try await client.publish(subject, payload: Data("message-\(i)".utf8))
+                try await client.publish(subject, payload: ByteBuffer.from("message-\(i)"))
             }
 
             // Messages should be distributed between subscribers (not duplicated)
@@ -338,7 +358,7 @@ struct IntegrationTests {
                 for await message in subscription {
                     if let replyTo = message.replyTo {
                         let response = "Response to: \(message.string ?? "")"
-                        try await client.publish(replyTo, payload: Data(response.utf8))
+                        try await client.publish(replyTo, payload: ByteBuffer.from(response))
                     }
                     break
                 }
@@ -348,7 +368,7 @@ struct IntegrationTests {
             try await Task.sleep(for: .milliseconds(100))
 
             // Send request
-            let response = try await client.request(subject, payload: Data("Hello".utf8), timeout: .seconds(5))
+            let response = try await client.request(subject, payload: ByteBuffer.from("Hello"), timeout: .seconds(5))
 
             #expect(response.string == "Response to: Hello")
 
@@ -384,7 +404,7 @@ struct IntegrationTests {
                         let request = try message.decode(Request.self)
                         let response = Response(message: "Hello, \(request.name)", computed: request.value * 2)
                         let responseData = try JSONEncoder().encode(response)
-                        try await client.publish(replyTo, payload: responseData)
+                        try await client.publish(replyTo, payload: ByteBuffer.from(responseData))
                     }
                     break
                 }
@@ -395,7 +415,7 @@ struct IntegrationTests {
             let request = Request(name: "Test", value: 21)
             let requestData = try JSONEncoder().encode(request)
 
-            let responseMessage = try await client.request(subject, payload: requestData, timeout: .seconds(5))
+            let responseMessage = try await client.request(subject, payload: ByteBuffer.from(requestData), timeout: .seconds(5))
             let response = try responseMessage.decode(Response.self)
 
             #expect(response.message == "Hello, Test")
@@ -417,7 +437,7 @@ struct IntegrationTests {
 
             // No responder - should timeout
             do {
-                _ = try await client.request(subject, payload: Data("test".utf8), timeout: .milliseconds(500))
+                _ = try await client.request(subject, payload: ByteBuffer.from("test"), timeout: .milliseconds(500))
                 Issue.record("Should have timed out")
             } catch {
                 // Expected timeout
@@ -474,7 +494,7 @@ struct IntegrationTests {
             ))
 
             // Publish with ack
-            let ack = try await js.publish("\(streamName).test", payload: Data("Hello JetStream".utf8))
+            let ack = try await js.publish("\(streamName).test", payload: ByteBuffer.from("Hello JetStream"))
 
             #expect(ack.stream == streamName)
             #expect(ack.seq >= 1)
@@ -502,7 +522,7 @@ struct IntegrationTests {
             // Publish multiple messages
             var sequences: [UInt64] = []
             for i in 1...10 {
-                let ack = try await js.publish("\(streamName).test", payload: Data("Message \(i)".utf8))
+                let ack = try await js.publish("\(streamName).test", payload: ByteBuffer.from("Message \(i)"))
                 sequences.append(ack.seq)
             }
 
@@ -534,7 +554,7 @@ struct IntegrationTests {
 
             // Publish some messages
             for i in 1...5 {
-                _ = try await js.publish("\(streamName).test", payload: Data("Message \(i)".utf8))
+                _ = try await js.publish("\(streamName).test", payload: ByteBuffer.from("Message \(i)"))
             }
 
             // Create consumer
@@ -575,9 +595,9 @@ struct IntegrationTests {
             ))
 
             // Publish to different subjects
-            _ = try await js.publish("\(streamName).orders", payload: Data("order1".utf8))
-            _ = try await js.publish("\(streamName).orders", payload: Data("order2".utf8))
-            _ = try await js.publish("\(streamName).events", payload: Data("event1".utf8))
+            _ = try await js.publish("\(streamName).orders", payload: ByteBuffer.from("order1"))
+            _ = try await js.publish("\(streamName).orders", payload: ByteBuffer.from("order2"))
+            _ = try await js.publish("\(streamName).events", payload: ByteBuffer.from("event1"))
 
             // Create consumer with filter
             let consumer = try await js.createConsumer(
@@ -616,7 +636,7 @@ struct IntegrationTests {
                 subjects: ["\(streamName).>"]
             ))
 
-            _ = try await js.publish("\(streamName).test", payload: Data("test message".utf8))
+            _ = try await js.publish("\(streamName).test", payload: ByteBuffer.from("test message"))
 
             let consumer = try await js.createConsumer(
                 stream: streamName,
@@ -662,7 +682,7 @@ struct IntegrationTests {
 
             // Publish messages
             for i in 1...10 {
-                _ = try await js.publish("\(streamName).test", payload: Data("Message \(i)".utf8))
+                _ = try await js.publish("\(streamName).test", payload: ByteBuffer.from("Message \(i)"))
             }
 
             // Purge stream
@@ -695,7 +715,7 @@ struct IntegrationTests {
             ))
 
             // Publish a message
-            let ack = try await js.publish("\(streamName).test", payload: Data("Specific message".utf8))
+            let ack = try await js.publish("\(streamName).test", payload: ByteBuffer.from("Specific message"))
 
             // Get message by sequence
             let storedMsg = try await stream.getMessage(seq: ack.seq)
@@ -726,7 +746,7 @@ struct IntegrationTests {
 
             // Publish more than max
             for i in 1...10 {
-                _ = try await js.publish("\(streamName).test", payload: Data("Message \(i)".utf8))
+                _ = try await js.publish("\(streamName).test", payload: ByteBuffer.from("Message \(i)"))
             }
 
             // Should only have 5 messages
@@ -757,7 +777,7 @@ struct IntegrationTests {
 
             // Publish messages
             for i in 1...5 {
-                _ = try await js.publish("\(streamName).tasks", payload: Data("Task \(i)".utf8))
+                _ = try await js.publish("\(streamName).tasks", payload: ByteBuffer.from("Task \(i)"))
             }
 
             // Create consumer and process
@@ -834,7 +854,7 @@ struct IntegrationTests {
 
             let subscription = try await client.subscribe(subject)
 
-            try await client.publish(subject, payload: Data(testMessage.utf8))
+            try await client.publish(subject, payload: ByteBuffer.from(testMessage))
 
             var receivedMessage: NatsMessage?
             for await message in subscription {
@@ -864,7 +884,7 @@ struct IntegrationTests {
 
             let subscription = try await client.subscribe(subject)
 
-            try await client.publish(subject, payload: Data("TLS with headers".utf8), headers: headers)
+            try await client.publish(subject, payload: ByteBuffer.from("TLS with headers"), headers: headers)
 
             var receivedMessage: NatsMessage?
             for await message in subscription {
@@ -895,7 +915,7 @@ struct IntegrationTests {
                 for await message in subscription {
                     if let replyTo = message.replyTo {
                         let response = "TLS Response: \(message.string ?? "")"
-                        try await client.publish(replyTo, payload: Data(response.utf8))
+                        try await client.publish(replyTo, payload: ByteBuffer.from(response))
                     }
                     break
                 }
@@ -903,7 +923,7 @@ struct IntegrationTests {
 
             try await Task.sleep(for: .milliseconds(100))
 
-            let response = try await client.request(subject, payload: Data("Secure Hello".utf8), timeout: .seconds(5))
+            let response = try await client.request(subject, payload: ByteBuffer.from("Secure Hello"), timeout: .seconds(5))
 
             #expect(response.string == "TLS Response: Secure Hello")
 
@@ -922,7 +942,8 @@ struct IntegrationTests {
 
             let subject = "test.tls.large.\(UUID().uuidString)"
             // 100KB payload
-            let largeData = Data(repeating: 0x42, count: 100_000)
+            var largeData = ByteBuffer()
+            largeData.writeRepeatingByte(0x42, count: 100_000)
 
             let subscription = try await client.subscribe(subject)
 
@@ -935,7 +956,7 @@ struct IntegrationTests {
             }
 
             #expect(receivedMessage != nil)
-            #expect(receivedMessage?.payload.count == 100_000)
+            #expect(receivedMessage?.payload.readableBytes == 100_000)
 
             await subscription.unsubscribe()
             await client.close()
@@ -959,7 +980,7 @@ struct IntegrationTests {
             ))
 
             // Publish with ack
-            let ack = try await js.publish("\(streamName).test", payload: Data("Secure JetStream message".utf8))
+            let ack = try await js.publish("\(streamName).test", payload: ByteBuffer.from("Secure JetStream message"))
             #expect(ack.stream == streamName)
             #expect(ack.seq >= 1)
 

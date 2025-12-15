@@ -16,15 +16,15 @@ public struct NKeyAuthenticator: @unchecked Sendable {
     /// The public key
     public let publicKey: String
 
-    /// NKey prefix bytes
+    /// NKey prefix bytes (shifted left by 3 to align with base32 encoding)
     private enum Prefix: UInt8 {
-        case seed = 18          // 'S'
-        case privateKey = 15    // 'P'
-        case server = 13        // 'N'
-        case cluster = 2        // 'C'
-        case operator_ = 14     // 'O'
-        case account = 0        // 'A'
-        case user = 20          // 'U'
+        case seed = 144         // 18 << 3 = 'S'
+        case privateKey = 120   // 15 << 3 = 'P'
+        case server = 104       // 13 << 3 = 'N'
+        case cluster = 16       // 2 << 3 = 'C'
+        case operator_ = 112    // 14 << 3 = 'O'
+        case account = 0        // 0 << 3 = 'A'
+        case user = 160         // 20 << 3 = 'U'
     }
 
     /// Initialize with an NKey seed

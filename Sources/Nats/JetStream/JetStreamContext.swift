@@ -3,6 +3,7 @@
 // Licensed under the Apache License, Version 2.0
 
 import Foundation
+import NIOCore
 
 /// JetStream context for interacting with JetStream-enabled servers
 public actor JetStreamContext {
@@ -39,7 +40,7 @@ public actor JetStreamContext {
 
     /// Get JetStream account information
     public func accountInfo() async throws(JetStreamError) -> AccountInfo {
-        let response = try await request(API.accountInfo(prefix), payload: nil)
+        let response = try await request(API.accountInfo(prefix), payload: ByteBuffer())
         return try decode(response, as: AccountInfo.self)
     }
 
@@ -77,7 +78,7 @@ public actor JetStreamContext {
             throw .streamNameRequired
         }
 
-        _ = try await request(API.streamDelete(prefix, name), payload: nil)
+        _ = try await request(API.streamDelete(prefix, name), payload: ByteBuffer())
     }
 
     /// Get stream information
@@ -86,7 +87,7 @@ public actor JetStreamContext {
             throw .streamNameRequired
         }
 
-        let response = try await request(API.streamInfo(prefix, name), payload: nil)
+        let response = try await request(API.streamInfo(prefix, name), payload: ByteBuffer())
         let info = try decode(response, as: StreamInfo.self)
 
         return Stream(context: self, info: info)
@@ -159,7 +160,7 @@ public actor JetStreamContext {
             throw .consumerNameRequired
         }
 
-        _ = try await request(API.consumerDelete(prefix, stream, consumer), payload: nil)
+        _ = try await request(API.consumerDelete(prefix, stream, consumer), payload: ByteBuffer())
     }
 
     /// Get consumer information
@@ -171,7 +172,7 @@ public actor JetStreamContext {
             throw .consumerNameRequired
         }
 
-        let response = try await request(API.consumerInfo(prefix, stream, name), payload: nil)
+        let response = try await request(API.consumerInfo(prefix, stream, name), payload: ByteBuffer())
         let info = try decode(response, as: ConsumerInfo.self)
 
         return Consumer(context: self, info: info, streamName: stream)
@@ -182,7 +183,7 @@ public actor JetStreamContext {
     /// Publish a message to JetStream with acknowledgment
     public func publish(
         _ subject: String,
-        payload: Data,
+        payload: ByteBuffer,
         options: PublishOptions = PublishOptions()
     ) async throws(JetStreamError) -> PubAck {
         var headers = NatsHeaders()
@@ -212,7 +213,7 @@ public actor JetStreamContext {
                 throw JetStreamError.publishFailed(description)
             }
 
-            return try JSONDecoder().decode(PubAck.self, from: response.payload)
+            return try JSONDecoder().decode(PubAck.self, from: response.data)
         } catch let error as JetStreamError {
             throw error
         } catch {
@@ -222,12 +223,12 @@ public actor JetStreamContext {
 
     // MARK: - Internal Methods
 
-    func request(_ subject: String, payload: Data?) async throws(JetStreamError) -> NatsMessage {
+    func request(_ subject: String, payload: ByteBuffer?) async throws(JetStreamError) -> NatsMessage {
         do {
-            let response = try await client.request(subject, payload: payload ?? Data(), timeout: timeout)
+            let response = try await client.request(subject, payload: payload ?? ByteBuffer(), timeout: timeout)
 
             // Check for JetStream error response
-            if let errorResponse = try? JSONDecoder().decode(JSErrorResponse.self, from: response.payload),
+            if let errorResponse = try? JSONDecoder().decode(JSErrorResponse.self, from: response.data),
                errorResponse.error != nil {
                 throw JetStreamError.apiError(
                     code: errorResponse.error!.code,
@@ -323,9 +324,12 @@ public actor JetStreamContext {
 
     // MARK: - Encoding/Decoding Helpers
 
-    private func encode<T: Encodable>(_ value: T) throws(JetStreamError) -> Data {
+    private func encode<T: Encodable>(_ value: T) throws(JetStreamError) -> ByteBuffer {
         do {
-            return try JSONEncoder().encode(value)
+            let data = try JSONEncoder().encode(value)
+            var buffer = ByteBuffer()
+            buffer.writeBytes(data)
+            return buffer
         } catch {
             throw JetStreamError.invalidStreamConfig(error.localizedDescription)
         }
@@ -353,7 +357,7 @@ public actor JetStreamContext {
 
                 throw DecodingError.dataCorruptedError(in: container, debugDescription: "Invalid date format: \(dateString)")
             }
-            return try decoder.decode(type, from: message.payload)
+            return try decoder.decode(type, from: message.data)
         } catch {
             throw JetStreamError.invalidAck(error.localizedDescription)
         }

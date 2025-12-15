@@ -61,9 +61,15 @@ public struct NatsMessage: Sendable {
 
     // MARK: - Payload Access
 
+    /// Get payload as ByteBuffer (zero-copy)
+    @inlinable
+    public var payload: ByteBuffer {
+        buffer
+    }
+
     /// Get payload as Data (creates a copy)
     @inlinable
-    public var payload: Data {
+    public var data: Data {
         buffer.getData() ?? Data()
     }
 
@@ -88,7 +94,7 @@ public struct NatsMessage: Sendable {
     /// Decode payload as JSON
     @inlinable
     public func decode<T: Decodable>(_ type: T.Type, decoder: JSONDecoder = JSONDecoder()) throws -> T {
-        try decoder.decode(type, from: payload)
+        try decoder.decode(type, from: data)
     }
 
     /// Check if payload is empty

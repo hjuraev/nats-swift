@@ -21,11 +21,8 @@ public struct JetStreamMessage: Sendable {
     /// Message subject
     public var subject: String { message.subject }
 
-    /// Message payload (creates a copy)
-    public var payload: Data { message.payload }
-
-    /// Zero-copy access to message buffer
-    public var buffer: ByteBuffer { message.buffer }
+    /// Message payload (zero-copy access to buffer)
+    public var payload: ByteBuffer { message.buffer }
 
     /// Zero-copy access to readable bytes
     public var readableBytesView: ByteBufferView { message.readableBytesView }
@@ -60,7 +57,7 @@ public struct JetStreamMessage: Sendable {
         guard let replyTo = message.replyTo else {
             throw JetStreamError.invalidAck("No reply subject for acknowledgement")
         }
-        try await sendAck(replyTo, payload: AckType.ack.data)
+        try await sendAck(replyTo, payload: AckType.ack.buffer)
     }
 
     /// Acknowledge the message and wait for confirmation
@@ -69,7 +66,7 @@ public struct JetStreamMessage: Sendable {
             throw JetStreamError.invalidAck("No reply subject for acknowledgement")
         }
         // For sync ack, we need a response
-        try await sendAckWithResponse(replyTo, payload: AckType.ack.data)
+        try await sendAckWithResponse(replyTo, payload: AckType.ack.buffer)
     }
 
     /// Negatively acknowledge the message (request redelivery)
@@ -78,12 +75,14 @@ public struct JetStreamMessage: Sendable {
             throw JetStreamError.invalidAck("No reply subject for acknowledgement")
         }
 
-        let payload: Data
+        let payload: ByteBuffer
         if let delay = delay {
             let nanos = Int64(delay.components.seconds * 1_000_000_000)
-            payload = "-NAK {\"delay\": \(nanos)}".data(using: .utf8)!
+            var buffer = ByteBuffer()
+            buffer.writeString("-NAK {\"delay\": \(nanos)}")
+            payload = buffer
         } else {
-            payload = AckType.nak.data
+            payload = AckType.nak.buffer
         }
 
         try await sendAck(replyTo, payload: payload)
@@ -94,7 +93,7 @@ public struct JetStreamMessage: Sendable {
         guard let replyTo = message.replyTo else {
             throw JetStreamError.invalidAck("No reply subject for acknowledgement")
         }
-        try await sendAck(replyTo, payload: AckType.inProgress.data)
+        try await sendAck(replyTo, payload: AckType.inProgress.buffer)
     }
 
     /// Terminate redelivery of this message
@@ -102,17 +101,17 @@ public struct JetStreamMessage: Sendable {
         guard let replyTo = message.replyTo else {
             throw JetStreamError.invalidAck("No reply subject for acknowledgement")
         }
-        try await sendAck(replyTo, payload: AckType.term.data)
+        try await sendAck(replyTo, payload: AckType.term.buffer)
     }
 
     // MARK: - Internal
 
-    private func sendAck(_ subject: String, payload: Data) async throws {
+    private func sendAck(_ subject: String, payload: ByteBuffer) async throws {
         // Simple ack - publish without waiting for response
         _ = try await context.request(subject, payload: payload)
     }
 
-    private func sendAckWithResponse(_ subject: String, payload: Data) async throws {
+    private func sendAckWithResponse(_ subject: String, payload: ByteBuffer) async throws {
         _ = try await context.request(subject, payload: payload)
     }
 
@@ -201,16 +200,18 @@ enum AckType {
     case inProgress
     case term
 
-    var data: Data {
+    var buffer: ByteBuffer {
+        var buf = ByteBuffer()
         switch self {
         case .ack:
-            return "+ACK".data(using: .utf8)!
+            buf.writeString("+ACK")
         case .nak:
-            return "-NAK".data(using: .utf8)!
+            buf.writeString("-NAK")
         case .inProgress:
-            return "+WPI".data(using: .utf8)!
+            buf.writeString("+WPI")
         case .term:
-            return "+TERM".data(using: .utf8)!
+            buf.writeString("+TERM")
         }
+        return buf
     }
 }

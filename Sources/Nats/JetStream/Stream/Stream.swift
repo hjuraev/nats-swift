@@ -3,6 +3,7 @@
 // Licensed under the Apache License, Version 2.0
 
 import Foundation
+import NIOCore
 
 /// A JetStream stream handle
 public actor Stream {
@@ -56,15 +57,16 @@ public actor Stream {
     }
 
     private func purge(request: PurgeRequest) async throws(JetStreamError) -> PurgeResponse {
-        let payload: Data
+        var payload = ByteBuffer()
         do {
-            payload = try JSONEncoder().encode(request)
+            let data = try JSONEncoder().encode(request)
+            payload.writeBytes(data)
         } catch {
             throw JetStreamError.invalidStreamConfig(error.localizedDescription)
         }
         let response = try await context.request("$JS.API.STREAM.PURGE.\(name)", payload: payload)
         do {
-            return try JSONDecoder().decode(PurgeResponse.self, from: response.payload)
+            return try JSONDecoder().decode(PurgeResponse.self, from: response.data)
         } catch {
             throw JetStreamError.invalidAck(error.localizedDescription)
         }
@@ -73,16 +75,17 @@ public actor Stream {
     /// Get a message by sequence number
     public func getMessage(seq: UInt64) async throws(JetStreamError) -> StoredMessage {
         let request = GetMessageRequest(seq: seq)
-        let payload: Data
+        var payload = ByteBuffer()
         do {
-            payload = try JSONEncoder().encode(request)
+            let data = try JSONEncoder().encode(request)
+            payload.writeBytes(data)
         } catch {
             throw JetStreamError.invalidStreamConfig(error.localizedDescription)
         }
         let response = try await context.request("$JS.API.STREAM.MSG.GET.\(name)", payload: payload)
         do {
             let decoder = Self.makeDecoder()
-            let wrapper = try decoder.decode(StoredMessageResponse.self, from: response.payload)
+            let wrapper = try decoder.decode(StoredMessageResponse.self, from: response.data)
             return wrapper.message
         } catch {
             throw JetStreamError.invalidAck(error.localizedDescription)
@@ -92,16 +95,17 @@ public actor Stream {
     /// Get the last message for a subject
     public func getLastMessage(subject: String) async throws(JetStreamError) -> StoredMessage {
         let request = GetMessageRequest(lastBySubject: subject)
-        let payload: Data
+        var payload = ByteBuffer()
         do {
-            payload = try JSONEncoder().encode(request)
+            let data = try JSONEncoder().encode(request)
+            payload.writeBytes(data)
         } catch {
             throw JetStreamError.invalidStreamConfig(error.localizedDescription)
         }
         let response = try await context.request("$JS.API.STREAM.MSG.GET.\(name)", payload: payload)
         do {
             let decoder = Self.makeDecoder()
-            let wrapper = try decoder.decode(StoredMessageResponse.self, from: response.payload)
+            let wrapper = try decoder.decode(StoredMessageResponse.self, from: response.data)
             return wrapper.message
         } catch {
             throw JetStreamError.invalidAck(error.localizedDescription)
@@ -111,9 +115,10 @@ public actor Stream {
     /// Delete a message by sequence number
     public func deleteMessage(seq: UInt64) async throws(JetStreamError) {
         let request = DeleteMessageRequest(seq: seq)
-        let payload: Data
+        var payload = ByteBuffer()
         do {
-            payload = try JSONEncoder().encode(request)
+            let data = try JSONEncoder().encode(request)
+            payload.writeBytes(data)
         } catch {
             throw JetStreamError.invalidStreamConfig(error.localizedDescription)
         }

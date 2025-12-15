@@ -4,6 +4,7 @@
 
 import Testing
 import Foundation
+import NIOCore
 @testable import Nats
 
 @Suite("NatsMessage Tests")
@@ -11,18 +12,19 @@ struct MessageTests {
 
     @Test("Message creation")
     func messageCreation() {
-        let payload = "Hello, World!".data(using: .utf8)!
+        var buffer = ByteBuffer()
+        buffer.writeString("Hello, World!")
         let message = NatsMessage(
             subject: "test.subject",
             replyTo: "reply.subject",
             headers: ["X-Test": "value"],
-            payload: payload
+            buffer: buffer
         )
 
         #expect(message.subject == "test.subject")
         #expect(message.replyTo == "reply.subject")
         #expect(message.headers?["X-Test"] == "value")
-        #expect(message.payload == payload)
+        #expect(message.payload == buffer)
     }
 
     @Test("Message string payload")

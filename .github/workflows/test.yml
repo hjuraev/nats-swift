@@ -36,17 +36,62 @@ jobs:
       - name: Generate TLS Certificates
         run: |
           mkdir -p ./certs
-          openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
-            -keyout ./certs/server-key.pem \
-            -out ./certs/server-cert.pem \
-            -subj "/CN=localhost/O=NATS-Test/C=US" \
-            -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
 
-      - name: Start NATS Server
+          # Generate CA key and certificate
+          openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+            -keyout ./certs/ca-key.pem \
+            -out ./certs/ca-cert.pem \
+            -subj "/CN=Test CA/O=NATS-Test/C=US"
+
+          # Generate Server certificate signed by CA
+          openssl req -nodes -newkey rsa:2048 \
+            -keyout ./certs/server-key.pem \
+            -out ./certs/server.csr \
+            -subj "/CN=localhost/O=NATS-Test/C=US"
+          openssl x509 -req -days 365 \
+            -in ./certs/server.csr \
+            -CA ./certs/ca-cert.pem \
+            -CAkey ./certs/ca-key.pem \
+            -CAcreateserial \
+            -out ./certs/server-cert.pem \
+            -extfile <(echo "subjectAltName=DNS:localhost,IP:127.0.0.1")
+
+          # Generate Client certificate for mTLS (signed by CA)
+          openssl req -nodes -newkey rsa:2048 \
+            -keyout ./certs/client-key.pem \
+            -out ./certs/client.csr \
+            -subj "/CN=test-client/O=NATS-Test/C=US"
+          openssl x509 -req -days 365 \
+            -in ./certs/client.csr \
+            -CA ./certs/ca-cert.pem \
+            -CAkey ./certs/ca-key.pem \
+            -CAcreateserial \
+            -out ./certs/client-cert.pem
+
+      - name: Start NATS Servers
         run: |
+          # Main NATS server with TLS (port 4222)
           nats-server -c .github/nats-server.conf &
-          sleep 3
-          nc -z localhost 4222 && echo "NATS server ready"
+
+          # Token authentication server (port 4223)
+          nats-server -c .github/nats-token.conf &
+
+          # User/Password authentication server (port 4224)
+          nats-server -c .github/nats-userpass.conf &
+
+          # NKey authentication server (port 4225)
+          nats-server -c .github/nats-nkey.conf &
+
+          # mTLS authentication server (port 4227)
+          nats-server -c .github/nats-mtls.conf &
+
+          # Wait for all servers to be ready
+          sleep 5
+          nc -z localhost 4222 && echo "Main NATS server ready (4222)"
+          nc -z localhost 4223 && echo "Token auth server ready (4223)"
+          nc -z localhost 4224 && echo "User/Pass auth server ready (4224)"
+          nc -z localhost 4225 && echo "NKey auth server ready (4225)"
+          nc -z localhost 4227 && echo "mTLS auth server ready (4227)"
 
       - name: Build
         run: swift build
