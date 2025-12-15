@@ -40,6 +40,9 @@ public actor NatsClient {
     // Connection ready continuation (for waiting on handshake)
     private var connectContinuation: CheckedContinuation<Void, any Error>?
 
+    // Track if we're waiting for connection confirmation (to catch auth errors)
+    private var awaitingConnectionConfirmation: Bool = false
+
     // Track if TLS is being used for current connection
     private var usingTLS: Bool = false
 
@@ -400,6 +403,18 @@ public actor NatsClient {
 
         case .err(let message):
             logger.error("Server error: \(message)")
+            // Check if this is an auth error during connection
+            if awaitingConnectionConfirmation {
+                awaitingConnectionConfirmation = false
+                let error: ConnectionError
+                if message.lowercased().contains("authorization") || message.lowercased().contains("authentication") {
+                    error = .authenticationFailed(reason: message)
+                } else {
+                    error = .io(message)
+                }
+                connectContinuation?.resume(throwing: error)
+                connectContinuation = nil
+            }
         }
     }
 
@@ -439,6 +454,10 @@ public actor NatsClient {
         // Send CONNECT
         let connectInfo = buildConnectInfo(serverInfo: info)
         do {
+            // Mark that we're waiting for connection confirmation
+            // This allows us to catch -ERR responses (auth failures) before confirming
+            awaitingConnectionConfirmation = true
+
             try await write(.connect(connectInfo))
             _ = stateMachine.transition(on: .connected(info))
             logger.info("Connected to NATS server")
@@ -449,10 +468,18 @@ public actor NatsClient {
                 handler.startPingTimer(interval: interval)
             }
 
-            // Resume connect continuation - connection is ready
-            connectContinuation?.resume(returning: ())
-            connectContinuation = nil
+            // Small delay to allow -ERR to arrive before confirming connection
+            // This catches auth failures that arrive shortly after CONNECT
+            try? await Task.sleep(for: .milliseconds(250))
+
+            // Only resume if we're still awaiting confirmation (not cancelled by -ERR handler)
+            if awaitingConnectionConfirmation {
+                awaitingConnectionConfirmation = false
+                connectContinuation?.resume(returning: ())
+                connectContinuation = nil
+            }
         } catch {
+            awaitingConnectionConfirmation = false
             logger.error("Failed to send CONNECT: \(error)")
             connectContinuation?.resume(throwing: ConnectionError.io(error.localizedDescription))
             connectContinuation = nil
