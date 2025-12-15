@@ -1,0 +1,61 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Swift
+        uses: swift-actions/setup-swift@v2
+        with:
+          swift-version: "6.0"
+
+      - name: Cache Swift packages
+        uses: actions/cache@v4
+        with:
+          path: .build
+          key: ${{ runner.os }}-swift-${{ hashFiles('Package.resolved') }}
+          restore-keys: |
+            ${{ runner.os }}-swift-
+
+      - name: Install NATS Server
+        run: |
+          wget -q https://github.com/nats-io/nats-server/releases/download/v2.10.0/nats-server-v2.10.0-linux-amd64.tar.gz
+          tar -xzf nats-server-v2.10.0-linux-amd64.tar.gz
+          sudo mv nats-server-v2.10.0-linux-amd64/nats-server /usr/local/bin/
+          nats-server --version
+
+      - name: Generate TLS Certificates
+        run: |
+          mkdir -p ./certs
+          openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+            -keyout ./certs/server-key.pem \
+            -out ./certs/server-cert.pem \
+            -subj "/CN=localhost/O=NATS-Test/C=US" \
+            -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+
+      - name: Start NATS Server
+        run: |
+          nats-server \
+            --tls \
+            --tlscert=./certs/server-cert.pem \
+            --tlskey=./certs/server-key.pem \
+            --jetstream \
+            --store_dir=/tmp/nats-jetstream \
+            --port 4222 &
+          sleep 3
+          nc -z localhost 4222 && echo "NATS server ready"
+
+      - name: Build
+        run: swift build
+
+      - name: Run Tests
+        run: swift test --parallel
