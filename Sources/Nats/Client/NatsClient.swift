@@ -3,9 +3,9 @@
 // Licensed under the Apache License, Version 2.0
 
 import Foundation
-import NIOCore
+@preconcurrency import NIOCore
 import NIOPosix
-import NIOSSL
+@preconcurrency import NIOSSL
 import Logging
 import Synchronization
 

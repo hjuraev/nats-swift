@@ -3,10 +3,10 @@
 // Licensed under the Apache License, Version 2.0
 
 import Foundation
-import Crypto
+@preconcurrency import Crypto
 
 /// NKey authentication using Ed25519 signatures
-public struct NKeyAuthenticator: Sendable {
+public struct NKeyAuthenticator: @unchecked Sendable {
     /// The NKey seed (starts with 'S')
     private let seed: String
 
