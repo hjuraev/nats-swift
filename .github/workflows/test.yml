@@ -44,12 +44,7 @@ jobs:
 
       - name: Start NATS Server
         run: |
-          nats-server \
-            --tlscert=./certs/server-cert.pem \
-            --tlskey=./certs/server-key.pem \
-            --jetstream \
-            --store_dir=/tmp/nats-jetstream \
-            --port 4222 &
+          nats-server -c .github/nats-server.conf &
           sleep 3
           nc -z localhost 4222 && echo "NATS server ready"
 
