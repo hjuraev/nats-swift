@@ -505,7 +505,7 @@ public actor NatsClient {
             subject: subject,
             replyTo: reply,
             headers: headers,
-            payload: payload.getData() ?? Data(),
+            buffer: payload,
             sid: sid
         )
 

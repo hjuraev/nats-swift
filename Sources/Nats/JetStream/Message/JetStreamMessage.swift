@@ -3,6 +3,7 @@
 // Licensed under the Apache License, Version 2.0
 
 import Foundation
+import NIOCore
 
 /// A JetStream message with acknowledgement capabilities
 public struct JetStreamMessage: Sendable {
@@ -20,8 +21,20 @@ public struct JetStreamMessage: Sendable {
     /// Message subject
     public var subject: String { message.subject }
 
-    /// Message payload
+    /// Message payload (creates a copy)
     public var payload: Data { message.payload }
+
+    /// Zero-copy access to message buffer
+    public var buffer: ByteBuffer { message.buffer }
+
+    /// Zero-copy access to readable bytes
+    public var readableBytesView: ByteBufferView { message.readableBytesView }
+
+    /// Access payload bytes without copying via closure
+    @inlinable
+    public func withUnsafeBytes<R>(_ body: (UnsafeRawBufferPointer) throws -> R) rethrows -> R {
+        try message.withUnsafeBytes(body)
+    }
 
     /// Message headers
     public var headers: NatsHeaders? { message.headers }
