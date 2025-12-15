@@ -47,9 +47,9 @@ certs/
 *.p12
 *.pfx
 
-# NATS data directory
-nats-data/
-jetstream/
+# NATS data directory (runtime data, not source code)
+/nats-data/
+/tmp/nats-jetstream/
 
 # Logs
 *.log
