@@ -33,6 +33,7 @@ public actor NatsClient {
 
     // Reconnection state
     private var reconnectionState: ReconnectionState
+    private var reconnectionTask: Task<Void, Never>?
 
     // Logger
     private let logger: Logger
@@ -108,6 +109,11 @@ public actor NatsClient {
     /// Close the connection
     public func close() async {
         logger.info("Closing NATS connection")
+
+        // Cancel any ongoing reconnection first
+        reconnectionTask?.cancel()
+        reconnectionTask = nil
+
         _ = stateMachine.transition(on: .close)
 
         // Finish all subscriptions
@@ -174,7 +180,8 @@ public actor NatsClient {
     public func publish(
         _ subject: String,
         payload: ByteBuffer,
-        reply: String
+        reply: String,
+        headers: NatsHeaders? = nil
     ) async throws(ProtocolError) {
         try Subject.validateForPublish(subject)
         try Subject.validateForPublish(reply)
@@ -184,7 +191,7 @@ public actor NatsClient {
         }
 
         do {
-            try await write(.publish(subject: subject, reply: reply, headers: nil, payload: payload))
+            try await write(.publish(subject: subject, reply: reply, headers: headers, payload: payload))
         } catch {
             throw .serverError("Write failed: \(error)")
         }
@@ -197,6 +204,7 @@ public actor NatsClient {
     public func request(
         _ subject: String,
         payload: ByteBuffer = ByteBuffer(),
+        headers: NatsHeaders? = nil,
         timeout: Duration? = nil
     ) async throws -> NatsMessage {
         try Subject.validateForPublish(subject)
@@ -218,7 +226,7 @@ public actor NatsClient {
 
                 // Publish request
                 do {
-                    try await self.write(.publish(subject: subject, reply: replySubject, headers: nil, payload: payload))
+                    try await self.write(.publish(subject: subject, reply: replySubject, headers: headers, payload: payload))
                     self._messagesSent.wrappingAdd(1, ordering: .relaxed)
                 } catch {
                     await self.removePendingRequest(replySubject: replySubject)
@@ -329,6 +337,11 @@ public actor NatsClient {
     // MARK: - Private Methods
 
     private func establishConnection() async throws {
+        // Prevent creating resources if already closed
+        guard stateMachine.state != .closed else {
+            throw ConnectionError.closed
+        }
+
         let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
         self.eventLoopGroup = group
 
@@ -565,11 +578,19 @@ public actor NatsClient {
             connectContinuation = nil
         }
 
+        // Don't attempt reconnection if already closed or closing
+        guard stateMachine.state != .closed else {
+            return
+        }
+
         let wasConnected = stateMachine.state.isActive
         _ = stateMachine.transition(on: .disconnected(error))
 
         if wasConnected && options.reconnect.enabled {
-            await attemptReconnection()
+            // Store the task so it can be cancelled by close()
+            reconnectionTask = Task {
+                await attemptReconnection()
+            }
         }
     }
 
@@ -577,10 +598,31 @@ public actor NatsClient {
         await reconnectionState.startReconnecting()
 
         while await reconnectionState.shouldContinue() {
+            // Check if cancelled or closed before each attempt
+            guard !Task.isCancelled && stateMachine.state != .closed else {
+                logger.debug("Reconnection cancelled or connection closed")
+                await reconnectionState.reset()
+                return
+            }
+
             let delay = await reconnectionState.nextDelay()
             logger.info("Attempting reconnection in \(delay)")
 
-            try? await Task.sleep(for: delay)
+            do {
+                try await Task.sleep(for: delay)
+            } catch {
+                // Task was cancelled during sleep
+                logger.debug("Reconnection sleep cancelled")
+                await reconnectionState.reset()
+                return
+            }
+
+            // Check again after sleep
+            guard !Task.isCancelled && stateMachine.state != .closed else {
+                logger.debug("Reconnection cancelled or connection closed")
+                await reconnectionState.reset()
+                return
+            }
 
             do {
                 try await establishConnection()
