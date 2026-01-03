@@ -2,6 +2,8 @@
 // Nexus Technologies, LLC
 // Licensed under the Apache License, Version 2.0
 
+import Foundation
+
 /// Errors specific to JetStream operations
 public enum JetStreamError: NatsErrorProtocol {
     /// JetStream is not enabled on this server
@@ -92,6 +94,14 @@ public enum JetStreamError: NatsErrorProtocol {
         case .publishFailed(let reason):
             return "Publish failed: \(reason)"
         }
+    }
+
+}
+
+extension JetStreamError: LocalizedError {
+    /// LocalizedError conformance for proper error logging
+    public var errorDescription: String? {
+        description
     }
 }
 

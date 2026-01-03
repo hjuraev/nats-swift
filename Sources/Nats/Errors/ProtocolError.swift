@@ -2,6 +2,8 @@
 // Nexus Technologies, LLC
 // Licensed under the Apache License, Version 2.0
 
+import Foundation
+
 /// Errors related to NATS protocol violations and message handling
 public enum ProtocolError: NatsErrorProtocol, Hashable {
     /// Subject is invalid (empty, contains invalid characters, or too long)
@@ -57,5 +59,13 @@ public enum ProtocolError: NatsErrorProtocol, Hashable {
         case .invalidQueueGroup(let name):
             return "Invalid queue group name: '\(name)'"
         }
+    }
+
+}
+
+extension ProtocolError: LocalizedError {
+    /// LocalizedError conformance for proper error logging
+    public var errorDescription: String? {
+        description
     }
 }

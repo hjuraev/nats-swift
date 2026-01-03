@@ -2,6 +2,8 @@
 // Nexus Technologies, LLC
 // Licensed under the Apache License, Version 2.0
 
+import Foundation
+
 /// Base protocol for all NATS errors, enabling typed throws
 public protocol NatsErrorProtocol: Error, Sendable, CustomStringConvertible {}
 
@@ -28,5 +30,12 @@ extension NatsError: CustomStringConvertible {
         case .cancelled:
             return "Operation cancelled"
         }
+    }
+}
+
+extension NatsError: LocalizedError {
+    /// LocalizedError conformance for proper error logging
+    public var errorDescription: String? {
+        description
     }
 }

@@ -2,6 +2,8 @@
 // Nexus Technologies, LLC
 // Licensed under the Apache License, Version 2.0
 
+import Foundation
+
 /// Errors related to connection lifecycle and network operations
 public enum ConnectionError: NatsErrorProtocol, Hashable {
     /// The provided URL is invalid
@@ -77,5 +79,13 @@ public enum ConnectionError: NatsErrorProtocol, Hashable {
         case .io(let message):
             return "IO error: \(message)"
         }
+    }
+
+}
+
+extension ConnectionError: LocalizedError {
+    /// LocalizedError conformance for proper error logging
+    public var errorDescription: String? {
+        description
     }
 }
