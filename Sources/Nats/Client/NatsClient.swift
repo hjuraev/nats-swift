@@ -472,6 +472,18 @@ public actor NatsClient {
             awaitingConnectionConfirmation = true
 
             try await write(.connect(connectInfo))
+
+            // Small delay to allow -ERR to arrive before confirming connection
+            // This catches auth failures that arrive shortly after CONNECT
+            try? await Task.sleep(for: .milliseconds(250))
+
+            // Only proceed if we're still awaiting confirmation (not cancelled by -ERR handler)
+            guard awaitingConnectionConfirmation else {
+                // Auth or other error occurred - don't complete connection
+                return
+            }
+
+            awaitingConnectionConfirmation = false
             _ = stateMachine.transition(on: .connected(info))
             logger.info("Connected to NATS server")
 
@@ -481,16 +493,8 @@ public actor NatsClient {
                 handler.startPingTimer(interval: interval)
             }
 
-            // Small delay to allow -ERR to arrive before confirming connection
-            // This catches auth failures that arrive shortly after CONNECT
-            try? await Task.sleep(for: .milliseconds(250))
-
-            // Only resume if we're still awaiting confirmation (not cancelled by -ERR handler)
-            if awaitingConnectionConfirmation {
-                awaitingConnectionConfirmation = false
-                connectContinuation?.resume(returning: ())
-                connectContinuation = nil
-            }
+            connectContinuation?.resume(returning: ())
+            connectContinuation = nil
         } catch {
             awaitingConnectionConfirmation = false
             logger.error("Failed to send CONNECT: \(error)")
