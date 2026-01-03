@@ -657,7 +657,19 @@ public actor NatsClient {
 
         switch options.auth {
         case .none:
-            break
+            // Fallback: extract auth from server URLs if not explicitly set
+            // This handles the case where users set servers directly instead of using url()
+            for serverURL in options.servers {
+                if let urlUser = serverURL.user {
+                    if let urlPass = serverURL.password {
+                        user = urlUser
+                        pass = urlPass
+                    } else {
+                        token = urlUser
+                    }
+                    break  // Use first URL with credentials
+                }
+            }
         case .token(let t):
             token = t
         case .userPass(let u, let p):
