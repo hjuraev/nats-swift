@@ -85,7 +85,7 @@ public actor NatsClient {
         }
 
         _ = stateMachine.transition(on: .connect)
-        logger.info("Connecting to NATS servers: \(options.servers)")
+        logger.info("Connecting to NATS servers: \(options.servers.map { $0.sanitizedDescription })")
 
         do {
             try await establishConnection()

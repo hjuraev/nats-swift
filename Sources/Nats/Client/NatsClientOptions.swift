@@ -129,7 +129,6 @@ extension NatsClientOptions {
         guard let url = URL(string: urlString) else {
             throw ConnectionError.invalidURL(urlString)
         }
-        servers = [url]
 
         // Extract auth from URL if present
         if let user = url.user {
@@ -144,17 +143,77 @@ extension NatsClientOptions {
         if url.scheme == "tls" || url.scheme == "nats+tls" || url.scheme == "wss" {
             tls.enabled = true
         }
+
+        // Store URL without credentials
+        servers = [url.strippingCredentials()]
     }
 
     /// Parse multiple URL strings
     public mutating func urls(_ urlStrings: [String]) throws {
         var parsedURLs: [URL] = []
+        var authExtracted = false
+
         for urlString in urlStrings {
             guard let url = URL(string: urlString) else {
                 throw ConnectionError.invalidURL(urlString)
             }
-            parsedURLs.append(url)
+
+            // Extract auth from first URL that has credentials
+            if !authExtracted, let user = url.user {
+                if let password = url.password {
+                    auth = .userPass(user: user, password: password)
+                } else {
+                    auth = .token(user)
+                }
+                authExtracted = true
+            }
+
+            // Check for TLS scheme
+            if url.scheme == "tls" || url.scheme == "nats+tls" || url.scheme == "wss" {
+                tls.enabled = true
+            }
+
+            // Store URL without credentials
+            parsedURLs.append(url.strippingCredentials())
         }
         servers = parsedURLs
+    }
+}
+
+// MARK: - URL Credential Sanitization
+
+extension URL {
+    /// Returns a copy of the URL with user credentials removed
+    func strippingCredentials() -> URL {
+        guard var components = URLComponents(url: self, resolvingAgainstBaseURL: false) else {
+            return self
+        }
+
+        // Only process if there are credentials to strip
+        guard components.user != nil || components.password != nil else {
+            return self
+        }
+
+        components.user = nil
+        components.password = nil
+
+        return components.url ?? self
+    }
+
+    /// Returns a string representation of the URL safe for logging (no credentials)
+    public var sanitizedDescription: String {
+        guard var components = URLComponents(url: self, resolvingAgainstBaseURL: false) else {
+            return self.absoluteString
+        }
+
+        // Only process if there are credentials to strip
+        guard components.user != nil || components.password != nil else {
+            return self.absoluteString
+        }
+
+        components.user = nil
+        components.password = nil
+
+        return components.string ?? self.absoluteString
     }
 }
