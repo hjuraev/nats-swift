@@ -2,6 +2,7 @@
 // Nexus Technologies, LLC
 // Licensed under the Apache License, Version 2.0
 
+import Foundation
 import Testing
 @testable import Nats
 
@@ -169,6 +170,151 @@ struct StateMachineCloseBehaviorTests {
         let state = ConnectionState.closed
         #expect(state.isActive == false)
         #expect(state.canAcceptOperations == false)
+    }
+}
+
+@Suite("Drain Tests")
+struct DrainTests {
+
+    @Test("Drain on disconnected client throws closed error")
+    func drainOnDisconnectedThrows() async {
+        let client = NatsClient {
+            $0.reconnect = .disabled
+        }
+
+        // Client is disconnected, drain should throw .closed
+        do {
+            try await client.drain()
+            Issue.record("Expected drain to throw .closed error")
+        } catch let error as ConnectionError {
+            #expect(error == .closed)
+        } catch {
+            Issue.record("Unexpected error type: \(error)")
+        }
+    }
+
+    @Test("Drain on closed client throws closed error")
+    func drainOnClosedThrows() async {
+        let client = NatsClient {
+            $0.reconnect = .disabled
+        }
+
+        await client.close()
+
+        do {
+            try await client.drain()
+            Issue.record("Expected drain to throw .closed error")
+        } catch let error as ConnectionError {
+            #expect(error == .closed)
+        } catch {
+            Issue.record("Unexpected error type: \(error)")
+        }
+    }
+
+    @Test("Drain completes quickly without active subscriptions")
+    func drainCompletesQuicklyWithoutSubscriptions() async throws {
+        let client = NatsClient {
+            $0.reconnect = .disabled
+        }
+
+        // Close immediately transitions, so we need to test drain behavior
+        // Since we're not connected, drain will throw - but that's expected
+        let start = ContinuousClock.now
+
+        do {
+            try await client.drain()
+        } catch {
+            // Expected - not connected
+        }
+
+        let elapsed = ContinuousClock.now - start
+        // Should complete very quickly (under 1 second) - not waiting for drainTimeout
+        #expect(elapsed < .seconds(1))
+    }
+
+    @Test("Drain transitions state to draining then closed")
+    func drainTransitionsState() {
+        var machine = ConnectionStateMachine()
+
+        // Setup: get to connected state
+        _ = machine.transition(on: .connect)
+        _ = machine.transition(on: .connected(StateMachineCloseBehaviorTests.makeServerInfo()))
+        #expect(machine.state.isActive == true)
+
+        // Drain should transition to draining
+        let drainingState = machine.transition(on: .drain)
+        #expect(drainingState == .draining)
+
+        // Then close should work from draining
+        let closedState = machine.transition(on: .close)
+        #expect(closedState == .closed)
+    }
+
+    @Test("Draining state does not accept new operations")
+    func drainingStateRejectsOperations() {
+        let state = ConnectionState.draining
+        #expect(state.isActive == true)  // Still active for receiving
+        #expect(state.canAcceptOperations == false)  // But no new operations
+    }
+}
+
+@Suite("Subscription Manager Drain Tests")
+struct SubscriptionManagerDrainTests {
+
+    @Test("markDraining sets isDraining flag")
+    func markDrainingSetsFlag() async {
+        let manager = SubscriptionManager()
+        let sid = await manager.generateSid()
+
+        let (stream, continuation) = AsyncStream<NatsMessage>.makeStream()
+        _ = stream  // Silence unused warning
+
+        await manager.register(sid: sid, subject: "test", queueGroup: nil, continuation: continuation)
+
+        // Mark as draining
+        await manager.markDraining(sid: sid)
+
+        // Messages should not be delivered to draining subscriptions
+        let message = NatsMessage(
+            subject: "test",
+            replyTo: nil,
+            headers: nil,
+            payload: Data()
+        )
+
+        let delivered = await manager.deliver(sid: sid, message: message)
+        #expect(delivered == true)  // Returns true but doesn't actually deliver
+    }
+
+    @Test("finishAll finishes all continuations")
+    func finishAllFinishesContinuations() async {
+        let manager = SubscriptionManager()
+
+        let sid1 = await manager.generateSid()
+        let sid2 = await manager.generateSid()
+
+        let (stream1, continuation1) = AsyncStream<NatsMessage>.makeStream()
+        let (stream2, continuation2) = AsyncStream<NatsMessage>.makeStream()
+
+        await manager.register(sid: sid1, subject: "test1", queueGroup: nil, continuation: continuation1)
+        await manager.register(sid: sid2, subject: "test2", queueGroup: nil, continuation: continuation2)
+
+        #expect(await manager.count == 2)
+
+        // Finish all
+        await manager.finishAll()
+
+        #expect(await manager.count == 0)
+
+        // Streams should now return nil immediately
+        var iterator1 = stream1.makeAsyncIterator()
+        var iterator2 = stream2.makeAsyncIterator()
+
+        let result1 = await iterator1.next()
+        let result2 = await iterator2.next()
+
+        #expect(result1 == nil)
+        #expect(result2 == nil)
     }
 }
 

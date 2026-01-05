@@ -140,6 +140,14 @@ public actor NatsClient {
     }
 
     /// Drain subscriptions and close gracefully
+    ///
+    /// This method:
+    /// 1. Stops accepting new publish/subscribe operations
+    /// 2. Sends UNSUB for all active subscriptions
+    /// 3. Allows a brief window for in-flight messages to be delivered
+    /// 4. Closes the connection
+    ///
+    /// Note: Subscription iterators will receive `nil` after drain completes.
     public func drain() async throws(ConnectionError) {
         guard stateMachine.state.isActive else {
             throw .closed
@@ -148,9 +156,20 @@ public actor NatsClient {
         logger.info("Draining NATS connection")
         _ = stateMachine.transition(on: .drain)
 
-        // Wait for pending messages with timeout
-        try? await Task.sleep(for: options.drainTimeout)
+        // Get all active subscriptions before we start draining
+        let activeSubscriptions = await subscriptionManager.getAllSubscriptions()
 
+        // Send UNSUB for all subscriptions to stop receiving new messages from server
+        for (sid, _, _) in activeSubscriptions {
+            try? await write(.unsubscribe(sid: sid, max: nil))
+            await subscriptionManager.markDraining(sid: sid)
+        }
+
+        // Brief delay to allow in-flight messages to arrive and be delivered
+        // This is much shorter than drainTimeout - just enough for network latency
+        try? await Task.sleep(for: .milliseconds(500))
+
+        // Now close the connection - this will finish all subscription continuations
         await close()
     }
 
