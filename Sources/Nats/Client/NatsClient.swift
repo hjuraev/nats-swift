@@ -461,6 +461,18 @@ public actor NatsClient {
     private func handleInfo(_ info: ServerInfo) async {
         logger.info("Received server info: \(info.serverName) v\(info.version)")
 
+        // Async INFO from the server after the initial handshake. NATS pushes
+        // these whenever cluster topology changes (peer added/removed, lame
+        // duck mode, connect_urls update). The protocol does NOT expect a
+        // client response — we must not re-send CONNECT here. Sending a
+        // duplicate CONNECT mid-session corrupts connection-scoped server
+        // state (subscriptions, no_responders flag, header support) and
+        // silently bricks the session even though the TCP socket stays open.
+        if case .connected = stateMachine.state {
+            handleAsyncServerInfoUpdate(info)
+            return
+        }
+
         // Check if TLS is requested via URL scheme or explicit config
         let serverURL = options.servers.first
         let tlsScheme = serverURL?.scheme == "tls"
@@ -527,6 +539,19 @@ public actor NatsClient {
             logger.error("Failed to send CONNECT: \(error)")
             connectContinuation?.resume(throwing: ConnectionError.io(error.localizedDescription))
             connectContinuation = nil
+        }
+    }
+
+    /// Apply an async INFO frame received after the initial handshake.
+    /// These carry cluster topology updates and are advisory — no response
+    /// is sent on the wire. Future work: feed `info.connectUrls` into the
+    /// reconnection server pool so failover can use newly-discovered peers.
+    private func handleAsyncServerInfoUpdate(_ info: ServerInfo) {
+        if let urls = info.connectUrls, !urls.isEmpty {
+            logger.debug("Cluster connect_urls update: \(urls)")
+        }
+        if info.lameDuckMode == true {
+            logger.notice("Server entered lame duck mode: \(info.serverName)")
         }
     }
 
