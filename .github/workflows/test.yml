@@ -35,7 +35,7 @@ jobs:
 
       - name: Generate TLS Certificates
         run: |
-          # Generate certs in .github/certs/ (config files use relative ./certs/ paths)
+          # Generate certs in .github/certs/ (the path the nats *.conf files reference)
           mkdir -p .github/certs
 
           # Generate CA key and certificate

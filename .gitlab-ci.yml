@@ -21,7 +21,7 @@ test:
     - tar -xzf nats-server-v${NATS_VERSION}-linux-amd64.tar.gz
     - mv nats-server-v${NATS_VERSION}-linux-amd64/nats-server /usr/local/bin/
     - nats-server --version
-    # Generate certs in .github/certs/ (config files use relative ./certs/ paths)
+    # Generate certs in .github/certs/ (the path the nats *.conf files reference)
     - mkdir -p .github/certs
     - |
       openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
