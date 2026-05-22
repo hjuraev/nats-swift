@@ -54,6 +54,12 @@ public actor NatsClient {
     // Track if TLS is being used for current connection
     private var usingTLS: Bool = false
 
+    // Monotonically increasing connection generation. Bumped on every
+    // (re)connection attempt so that callbacks from a superseded channel
+    // (a late INFO or channelInactive from a connection we are tearing down)
+    // can be identified and ignored instead of corrupting the live one.
+    private var connectionGeneration: UInt64 = 0
+
     // MARK: - Initialization
 
     /// Create a new NATS client with default options
@@ -167,7 +173,7 @@ public actor NatsClient {
         let activeSubscriptions = await subscriptionManager.getAllSubscriptions()
 
         // Send UNSUB for all subscriptions to stop receiving new messages from server
-        for (sid, _, _) in activeSubscriptions {
+        for (sid, _, _, _) in activeSubscriptions {
             try? await write(.unsubscribe(sid: sid, max: nil))
             await subscriptionManager.markDraining(sid: sid)
         }
@@ -368,8 +374,30 @@ public actor NatsClient {
             throw ConnectionError.closed
         }
 
-        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
-        self.eventLoopGroup = group
+        // Bump the generation before touching the old channel: callbacks from
+        // the previous channel captured the old generation, so any late event
+        // it emits while we tear it down is ignored (see handleConnection*).
+        connectionGeneration &+= 1
+        let generation = connectionGeneration
+
+        // Close the previous connection's channel so a dropped or
+        // failed-handshake socket isn't left dangling on the event loop.
+        if let oldChannel = channel {
+            try? await oldChannel.close()
+            self.channel = nil
+        }
+        self.connectionHandler = nil
+
+        // Reuse the EventLoopGroup across reconnect attempts — it is only
+        // shut down by close(). Creating a fresh group every attempt would
+        // leak a group and its backing thread on each reconnect.
+        let group: EventLoopGroup
+        if let existingGroup = eventLoopGroup {
+            group = existingGroup
+        } else {
+            group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+            self.eventLoopGroup = group
+        }
 
         guard let serverURL = options.servers.first else {
             throw ConnectionError.noServersAvailable
@@ -386,13 +414,13 @@ public actor NatsClient {
             logger: logger,
             maxPingsOut: options.maxPingsOut,
             onMessage: { [weak self] op in
-                Task { await self?.handleServerOp(op) }
+                Task { await self?.handleServerOp(op, generation: generation) }
             },
             onOpen: { [weak self] in
-                Task { await self?.handleConnectionOpen() }
+                Task { await self?.handleConnectionOpen(generation: generation) }
             },
             onClose: { [weak self] error in
-                Task { await self?.handleConnectionClose(error: error) }
+                Task { await self?.handleConnectionClose(error: error, generation: generation) }
             }
         )
         self.connectionHandler = handler
@@ -419,7 +447,11 @@ public actor NatsClient {
         }
     }
 
-    private func handleServerOp(_ op: ServerOp) async {
+    private func handleServerOp(_ op: ServerOp, generation: UInt64) async {
+        // Drop frames from a superseded connection (e.g. a late INFO from a
+        // channel being torn down during reconnect).
+        guard generation == connectionGeneration else { return }
+
         switch op {
         case .info(let serverInfo):
             await handleInfo(serverInfo)
@@ -620,11 +652,20 @@ public actor NatsClient {
         }
     }
 
-    private func handleConnectionOpen() async {
+    private func handleConnectionOpen(generation: UInt64) async {
+        guard generation == connectionGeneration else { return }
         logger.trace("Connection opened")
     }
 
-    private func handleConnectionClose(error: Error?) async {
+    private func handleConnectionClose(error: Error?, generation: UInt64) async {
+        // Ignore close events from a superseded connection. Without this,
+        // tearing down the old channel during a reconnect would knock the new
+        // connection's state back to .disconnected or spawn a rogue reconnect.
+        guard generation == connectionGeneration else {
+            logger.trace("Ignoring close from stale connection generation \(generation)")
+            return
+        }
+
         logger.info("Connection closed: \(error?.localizedDescription ?? "no error")")
 
         // If we're still waiting on connect, fail the continuation
@@ -681,12 +722,30 @@ public actor NatsClient {
             }
 
             do {
+                // Move the state machine into .connecting so the handshake
+                // has a valid path to .connected. Without this the state is
+                // still .disconnected, which has no transition to .connected,
+                // leaving the client permanently stuck after a reconnect.
+                _ = stateMachine.transition(on: .connect)
+
                 try await establishConnection()
+
+                // Wait for the NATS handshake to complete (INFO received,
+                // CONNECT sent and confirmed) before resubscribing.
+                // establishConnection() only completes the TCP connect — SUB
+                // frames sent before CONNECT race the handshake and are
+                // dropped by the server. handleInfo() resumes this
+                // continuation once the session is fully connected.
+                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
+                    self.connectContinuation = continuation
+                }
+
                 await resubscribeAll()
                 await reconnectionState.reset()
                 logger.info("Reconnected successfully")
                 return
             } catch {
+                connectContinuation = nil
                 await reconnectionState.recordAttempt(error: error)
                 logger.warning("Reconnection attempt failed: \(error)")
             }
@@ -696,10 +755,26 @@ public actor NatsClient {
         await close()
     }
 
+    /// Re-send SUB for every active subscription after a reconnect.
+    ///
+    /// Must only be called once the NATS handshake has completed — SUB frames
+    /// sent before CONNECT are discarded by the server, which is what would
+    /// otherwise make subscriptions silently stop receiving messages after a
+    /// reconnect.
     private func resubscribeAll() async {
         let subs = await subscriptionManager.getAllSubscriptions()
-        for (sid, subject, queue) in subs {
-            try? await write(.subscribe(sid: sid, subject: subject, queue: queue))
+        logger.debug("Resubscribing to \(subs.count) subject(s) after reconnect")
+        for (sid, subject, queue, remainingMax) in subs {
+            do {
+                try await write(.subscribe(sid: sid, subject: subject, queue: queue))
+                // Re-apply any auto-unsubscribe limit so the server still
+                // stops delivery after the originally requested total count.
+                if let remainingMax = remainingMax {
+                    try await write(.unsubscribe(sid: sid, max: remainingMax))
+                }
+            } catch {
+                logger.warning("Failed to resubscribe to \(subject): \(error)")
+            }
         }
     }
 

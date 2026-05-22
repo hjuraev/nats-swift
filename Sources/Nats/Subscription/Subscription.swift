@@ -190,10 +190,16 @@ actor SubscriptionManager {
         return true
     }
 
-    /// Get all active subscription IDs and subjects (for resubscription)
-    func getAllSubscriptions() -> [(sid: String, subject: String, queueGroup: String?)] {
+    /// Get all active subscriptions (for resubscription after a reconnect).
+    ///
+    /// `remainingMax` carries the number of messages the server should still
+    /// deliver before auto-unsubscribing — i.e. the original limit minus what
+    /// has already been delivered — or `nil` for subscriptions without a limit.
+    func getAllSubscriptions() -> [(sid: String, subject: String, queueGroup: String?, remainingMax: Int?)] {
         subscriptions.compactMap { sid, state in
-            state.isDraining ? nil : (sid, state.subject, state.queueGroup)
+            guard !state.isDraining else { return nil }
+            let remainingMax = state.maxMessages.map { max(0, $0 - state.messageCount) }
+            return (sid, state.subject, state.queueGroup, remainingMax)
         }
     }
 
