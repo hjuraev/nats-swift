@@ -48,6 +48,18 @@ public actor NatsClient {
     // Connection ready continuation (for waiting on handshake)
     private var connectContinuation: CheckedContinuation<Void, any Error>?
 
+    // Whether a connect/reconnect attempt is currently waiting on a handshake.
+    // Gates `settleHandshake` so a close event arriving outside an attempt is
+    // not parked and mis-delivered to some later connect().
+    private var handshakeInFlight: Bool = false
+
+    // Handshake outcome that arrived before its waiter did. The INFO handler
+    // runs on its own task, so it can in principle reach the resume point
+    // before connect() has stored its continuation; parking the result here
+    // means the waiter picks it up instead of suspending on a continuation
+    // nothing will ever resume.
+    private var pendingHandshakeResult: Result<Void, any Error>?
+
     // Track if we're waiting for connection confirmation (to catch auth errors)
     private var awaitingConnectionConfirmation: Bool = false
 
@@ -100,23 +112,100 @@ public actor NatsClient {
         _ = stateMachine.transition(on: .connect)
         logger.info("Connecting to NATS servers: \(options.servers.map { $0.sanitizedDescription })")
 
+        beginHandshake()
         do {
             try await establishConnection()
 
             // Wait for the handshake to complete (INFO received, CONNECT sent)
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
-                self.connectContinuation = continuation
-            }
+            try await waitForHandshake()
         } catch let error as ConnectionError {
-            connectContinuation = nil
+            endHandshake()
             _ = stateMachine.transition(on: .disconnected(error))
             throw error
         } catch {
-            connectContinuation = nil
+            endHandshake()
             let connError = ConnectionError.io(error.localizedDescription)
             _ = stateMachine.transition(on: .disconnected(connError))
             throw connError
         }
+    }
+
+    // MARK: - Handshake Handoff
+
+    /// Mark the start of a connect/reconnect attempt, discarding any outcome
+    /// left parked by a previous one.
+    private func beginHandshake() {
+        handshakeInFlight = true
+        pendingHandshakeResult = nil
+        connectContinuation = nil
+    }
+
+    /// Mark the attempt finished and drop any state it left behind.
+    private func endHandshake() {
+        handshakeInFlight = false
+        pendingHandshakeResult = nil
+        connectContinuation = nil
+    }
+
+    /// Deliver a handshake outcome to whoever is waiting in `waitForHandshake()`.
+    ///
+    /// Safe to call before the waiter has stored its continuation: the result
+    /// is parked and collected when the waiter arrives. Every handshake
+    /// success/failure path must funnel through here rather than poking
+    /// `connectContinuation` directly, or an outcome that outruns its waiter
+    /// resumes nobody and the connect hangs on a healthy socket.
+    private func settleHandshake(_ result: Result<Void, any Error>) {
+        guard handshakeInFlight else { return }
+
+        if let continuation = connectContinuation {
+            connectContinuation = nil
+            pendingHandshakeResult = nil
+            handshakeInFlight = false
+            continuation.resume(with: result)
+        } else {
+            pendingHandshakeResult = result
+        }
+    }
+
+    /// Suspend until the handshake settles, honouring cancellation.
+    ///
+    /// The bare `withCheckedThrowingContinuation` this replaces was not
+    /// cancellation-aware: cancelling a connect requested cancellation and then
+    /// waited forever, because nothing resumed the continuation. Callers that
+    /// race this against a deadline (Nexus boot does) were left holding a task
+    /// that could never finish.
+    private func waitForHandshake() async throws {
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
+                // Re-check under the same actor step that stores the
+                // continuation, so an outcome cannot slip in between.
+                if let parked = pendingHandshakeResult {
+                    pendingHandshakeResult = nil
+                    handshakeInFlight = false
+                    continuation.resume(with: parked)
+                } else {
+                    connectContinuation = continuation
+                }
+            }
+        } onCancel: {
+            Task { await self.abandonHandshake() }
+        }
+    }
+
+    /// Fail an in-flight handshake wait and tear down the half-open attempt.
+    ///
+    /// Without the teardown a cancelled connect would leave a socket, an
+    /// event-loop group and a reconnect loop running on behalf of a caller that
+    /// has already given up.
+    private func abandonHandshake() async {
+        guard handshakeInFlight else { return }
+
+        let continuation = connectContinuation
+        endHandshake()
+        continuation?.resume(throwing: CancellationError())
+
+        logger.info("Connect cancelled; tearing down the in-flight attempt")
+        await close()
     }
 
     /// Close the connection
@@ -484,8 +573,7 @@ public actor NatsClient {
                 } else {
                     error = .io(message)
                 }
-                connectContinuation?.resume(throwing: error)
-                connectContinuation = nil
+                settleHandshake(.failure(error))
             }
         }
     }
@@ -514,8 +602,7 @@ public actor NatsClient {
         if info.tlsRequired == true && !wantsTLS {
             logger.error("Server requires TLS but client is not configured for it")
             let error = ConnectionError.tlsRequired
-            connectContinuation?.resume(throwing: error)
-            connectContinuation = nil
+            settleHandshake(.failure(error))
             await close()
             return
         }
@@ -528,8 +615,7 @@ public actor NatsClient {
                 logger.info("TLS upgrade successful")
             } catch {
                 logger.error("TLS upgrade failed: \(error)")
-                connectContinuation?.resume(throwing: ConnectionError.tlsHandshakeFailed(reason: error.localizedDescription))
-                connectContinuation = nil
+                settleHandshake(.failure(ConnectionError.tlsHandshakeFailed(reason: error.localizedDescription)))
                 await close()
                 return
             }
@@ -564,13 +650,11 @@ public actor NatsClient {
                 handler.startPingTimer(interval: interval)
             }
 
-            connectContinuation?.resume(returning: ())
-            connectContinuation = nil
+            settleHandshake(.success(()))
         } catch {
             awaitingConnectionConfirmation = false
             logger.error("Failed to send CONNECT: \(error)")
-            connectContinuation?.resume(throwing: ConnectionError.io(error.localizedDescription))
-            connectContinuation = nil
+            settleHandshake(.failure(ConnectionError.io(error.localizedDescription)))
         }
     }
 
@@ -668,12 +752,10 @@ public actor NatsClient {
 
         logger.info("Connection closed: \(error?.localizedDescription ?? "no error")")
 
-        // If we're still waiting on connect, fail the continuation
-        if let continuation = connectContinuation {
-            let closeError = error ?? ConnectionError.closed
-            continuation.resume(throwing: closeError)
-            connectContinuation = nil
-        }
+        // If we're still waiting on connect, fail the handshake. The
+        // in-flight guard inside settleHandshake keeps a close that arrives
+        // outside an attempt from being parked for a later connect().
+        settleHandshake(.failure(error ?? ConnectionError.closed))
 
         // Don't attempt reconnection if already closed or closing
         guard stateMachine.state != .closed else {
@@ -728,24 +810,23 @@ public actor NatsClient {
                 // leaving the client permanently stuck after a reconnect.
                 _ = stateMachine.transition(on: .connect)
 
+                beginHandshake()
                 try await establishConnection()
 
                 // Wait for the NATS handshake to complete (INFO received,
                 // CONNECT sent and confirmed) before resubscribing.
                 // establishConnection() only completes the TCP connect — SUB
                 // frames sent before CONNECT race the handshake and are
-                // dropped by the server. handleInfo() resumes this
-                // continuation once the session is fully connected.
-                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
-                    self.connectContinuation = continuation
-                }
+                // dropped by the server. handleInfo() settles this wait once
+                // the session is fully connected.
+                try await waitForHandshake()
 
                 await resubscribeAll()
                 await reconnectionState.reset()
                 logger.info("Reconnected successfully")
                 return
             } catch {
-                connectContinuation = nil
+                endHandshake()
                 await reconnectionState.recordAttempt(error: error)
                 logger.warning("Reconnection attempt failed: \(error)")
             }
