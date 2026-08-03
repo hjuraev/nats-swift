@@ -130,11 +130,18 @@ struct ConnectCancellationTests {
         }
     }
 
-    /// The abandoned attempt must not be left running: after cancellation the
-    /// client should be closed, not sitting on a half-open socket with an
-    /// event-loop group still up.
-    @Test("A cancelled connect tears the attempt down", .timeLimit(.minutes(1)))
-    func cancelledConnectTearsDown() async throws {
+    /// The abandoned attempt must not be left running — but it must also not
+    /// poison the client.
+    ///
+    /// Cancellation originally routed its teardown through `close()`, which
+    /// parks the state machine in the terminal `.closed` state. That made a
+    /// cancelled connect unrecoverable: every subsequent `connect()` fell
+    /// straight through to the `.closed` guard in `establishConnection()` and
+    /// threw "Connection is closed" in milliseconds. Anything that bounds
+    /// connect with a deadline — the entire reason cancellation is supported —
+    /// would poison its own client on the first timeout.
+    @Test("A cancelled connect leaves the client retryable, not closed", .timeLimit(.minutes(1)))
+    func cancelledConnectLeavesClientRetryable() async throws {
         let server = try await SilentServer.start()
         defer { Task { await server.stop() } }
 
@@ -161,10 +168,34 @@ struct ConnectCancellationTests {
         // Teardown runs in the cancellation handler's own task; give it a moment.
         try await Task.sleep(for: .milliseconds(500))
 
-        let state = await client.state
-        #expect(state == .closed, "expected the abandoned attempt to be closed, was \(state)")
-
         let connected = await client.isConnected
-        #expect(connected == false)
+        #expect(connected == false, "the abandoned attempt should not report connected")
+
+        let state = await client.state
+        #expect(
+            state != .closed,
+            "a cancelled connect must not park the client in the terminal .closed state"
+        )
+
+        // The real property: a second attempt must actually be attempted, not
+        // rejected out of hand. It still cannot succeed against a silent server,
+        // so it should reach the handshake wait and stay there rather than
+        // failing instantly off the `.closed` guard.
+        let retry = OutcomeBox()
+        let retryTask = Task {
+            do {
+                try await client.connect()
+                retry.set(.success(()))
+            } catch {
+                retry.set(.failure(error))
+            }
+        }
+        defer { retryTask.cancel() }
+
+        let settled = await retry.wait(upTo: .seconds(1))
+        #expect(
+            settled == nil,
+            "retry after a cancelled connect should reach the handshake wait, not fail immediately"
+        )
     }
 }

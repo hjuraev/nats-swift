@@ -194,9 +194,22 @@ public actor NatsClient {
 
     /// Fail an in-flight handshake wait and tear down the half-open attempt.
     ///
-    /// Without the teardown a cancelled connect would leave a socket, an
-    /// event-loop group and a reconnect loop running on behalf of a caller that
-    /// has already given up.
+    /// Without the teardown a cancelled connect would leave a socket running on
+    /// behalf of a caller that has already given up.
+    ///
+    /// Deliberately does NOT call `close()`. `close()` transitions to `.closed`,
+    /// which the state machine treats as terminal — no event transitions out of
+    /// it — so routing cancellation through it left the client permanently
+    /// unusable: every later `connect()` fell straight through to
+    /// `establishConnection()`'s `.closed` guard and threw "Connection is
+    /// closed" in milliseconds. A cancelled attempt has to be exactly as
+    /// retryable as a failed one, so this tears down only the half-open socket
+    /// and lets `connect()`'s own catch put the state machine back in
+    /// `.disconnected`, which is what an ordinary connect failure does.
+    ///
+    /// The event-loop group is left up on purpose: `establishConnection()`
+    /// reuses it across attempts, and `close()` remains the way to release it.
+    /// That matches how a refused connect already behaves.
     private func abandonHandshake() async {
         guard handshakeInFlight else { return }
 
@@ -205,7 +218,12 @@ public actor NatsClient {
         continuation?.resume(throwing: CancellationError())
 
         logger.info("Connect cancelled; tearing down the in-flight attempt")
-        await close()
+
+        if let channel {
+            try? await channel.close()
+        }
+        channel = nil
+        connectionHandler = nil
     }
 
     /// Close the connection
