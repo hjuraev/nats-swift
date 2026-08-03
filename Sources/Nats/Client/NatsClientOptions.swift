@@ -28,6 +28,11 @@ public struct NatsClientOptions: Sendable {
     /// Maximum outstanding PINGs before connection is considered stale
     public var maxPingsOut: Int
 
+    /// Maximum time for a single connection attempt: the TCP connect plus the
+    /// NATS handshake, measured as one budget rather than one deadline each.
+    /// Applies to reconnect attempts as well as the initial connect.
+    public var connectTimeout: Duration
+
     /// Default timeout for request-reply operations
     public var requestTimeout: Duration
 
@@ -60,6 +65,7 @@ public struct NatsClientOptions: Sendable {
         auth: AuthConfig = .none,
         pingInterval: Duration = .seconds(120),
         maxPingsOut: Int = 2,
+        connectTimeout: Duration = .seconds(5),
         requestTimeout: Duration = .seconds(5),
         drainTimeout: Duration = .seconds(30),
         echo: Bool = true,
@@ -76,6 +82,7 @@ public struct NatsClientOptions: Sendable {
         self.auth = auth
         self.pingInterval = pingInterval
         self.maxPingsOut = maxPingsOut
+        self.connectTimeout = connectTimeout
         self.requestTimeout = requestTimeout
         self.drainTimeout = drainTimeout
         self.echo = echo
