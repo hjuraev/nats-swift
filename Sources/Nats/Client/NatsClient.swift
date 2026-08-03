@@ -112,12 +112,17 @@ public actor NatsClient {
         _ = stateMachine.transition(on: .connect)
         logger.info("Connecting to NATS servers: \(options.servers.map { $0.sanitizedDescription })")
 
+        // One budget across both phases, so `connectTimeout` means what it says.
+        // Bounding each phase separately would let a slow-but-not-stalled TCP
+        // connect plus a slow handshake take twice the configured maximum.
+        let deadline = ContinuousClock.now.advanced(by: options.connectTimeout)
+
         beginHandshake()
         do {
             try await establishConnection()
 
             // Wait for the handshake to complete (INFO received, CONNECT sent)
-            try await waitForHandshake()
+            try await waitForHandshake(timeout: remaining(until: deadline))
         } catch let error as ConnectionError {
             endHandshake()
             _ = stateMachine.transition(on: .disconnected(error))
@@ -167,14 +172,34 @@ public actor NatsClient {
         }
     }
 
-    /// Suspend until the handshake settles, honouring cancellation.
+    /// Time left until `deadline`, never negative.
+    private func remaining(until deadline: ContinuousClock.Instant) -> Duration {
+        let left = ContinuousClock.now.duration(to: deadline)
+        return left > .zero ? left : .zero
+    }
+
+    /// Suspend until the handshake settles, bounded by `timeout` and honouring
+    /// cancellation.
     ///
-    /// The bare `withCheckedThrowingContinuation` this replaces was not
-    /// cancellation-aware: cancelling a connect requested cancellation and then
-    /// waited forever, because nothing resumed the continuation. Callers that
-    /// race this against a deadline (Nexus boot does) were left holding a task
-    /// that could never finish.
-    private func waitForHandshake() async throws {
+    /// Two distinct properties, both required:
+    ///
+    /// - *Cancellable* — the wait unwinds when the enclosing task is cancelled.
+    ///   The bare `withCheckedThrowingContinuation` this replaces was not:
+    ///   cancelling a connect requested cancellation and then waited forever.
+    /// - *Bounded* — something fires on its own, with no external canceller. A
+    ///   server that accepts the socket and never sends INFO must not be able to
+    ///   block a connect indefinitely just because the caller forgot a deadline.
+    private func waitForHandshake(timeout: Duration) async throws {
+        let timer = Task { [weak self] in
+            do {
+                try await Task.sleep(for: timeout)
+            } catch {
+                return  // cancelled: the handshake already settled
+            }
+            await self?.failHandshake(with: ConnectionError.timeout(after: timeout))
+        }
+        defer { timer.cancel() }
+
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
                 // Re-check under the same actor step that stores the
@@ -188,36 +213,41 @@ public actor NatsClient {
                 }
             }
         } onCancel: {
-            Task { await self.abandonHandshake() }
+            Task { await self.failHandshake(with: CancellationError()) }
         }
     }
 
     /// Fail an in-flight handshake wait and tear down the half-open attempt.
     ///
-    /// Without the teardown a cancelled connect would leave a socket running on
-    /// behalf of a caller that has already given up.
+    /// Shared by cancellation and by the connect deadline. Delivery goes through
+    /// `settleHandshake`, so this is first-writer-wins on an actor: whichever of
+    /// {handshake, timeout, cancellation} arrives first owns the outcome and the
+    /// others become no-ops. That is what stops a connect which succeeds just
+    /// before the deadline from being double-resumed — and, because
+    /// `settleHandshake` parks a result that outruns its waiter, a timeout that
+    /// fires before `waitForHandshake` has stored its continuation is collected
+    /// rather than lost.
     ///
     /// Deliberately does NOT call `close()`. `close()` transitions to `.closed`,
     /// which the state machine treats as terminal — no event transitions out of
-    /// it — so routing cancellation through it left the client permanently
-    /// unusable: every later `connect()` fell straight through to
+    /// it — so routing failure through it left the client permanently unusable:
+    /// every later `connect()` fell straight through to
     /// `establishConnection()`'s `.closed` guard and threw "Connection is
-    /// closed" in milliseconds. A cancelled attempt has to be exactly as
+    /// closed" in milliseconds. An abandoned attempt has to be exactly as
     /// retryable as a failed one, so this tears down only the half-open socket
     /// and lets `connect()`'s own catch put the state machine back in
-    /// `.disconnected`, which is what an ordinary connect failure does.
+    /// `.disconnected`, which is what an ordinary connect failure does. That
+    /// matters more now that a *timeout* reaches this path, not just an explicit
+    /// cancellation.
     ///
     /// The event-loop group is left up on purpose: `establishConnection()`
     /// reuses it across attempts, and `close()` remains the way to release it.
     /// That matches how a refused connect already behaves.
-    private func abandonHandshake() async {
+    private func failHandshake(with error: any Error) async {
         guard handshakeInFlight else { return }
 
-        let continuation = connectContinuation
-        endHandshake()
-        continuation?.resume(throwing: CancellationError())
-
-        logger.info("Connect cancelled; tearing down the in-flight attempt")
+        settleHandshake(.failure(error))
+        logger.info("Connect attempt abandoned: \(error)")
 
         if let channel {
             try? await channel.close()
@@ -535,6 +565,10 @@ public actor NatsClient {
         // NATS uses TLS upgrade protocol - connect via TCP first, then upgrade after INFO
         let protocolLogger = self.logger
         let bootstrap = ClientBootstrap(group: group)
+            // Without this the TCP phase falls back to NIO's own default rather
+            // than anything the caller configured, so a black-holed SYN could
+            // outlast connectTimeout entirely.
+            .connectTimeout(TimeAmount(options.connectTimeout))
             .channelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
             .channelOption(ChannelOptions.tcpOption(.tcp_nodelay), value: 1)
             .channelInitializer { channel in
@@ -664,7 +698,7 @@ public actor NatsClient {
 
             // Start ping timer
             if let handler = connectionHandler {
-                let interval = TimeAmount.nanoseconds(Int64(options.pingInterval.components.seconds * 1_000_000_000))
+                let interval = TimeAmount(options.pingInterval)
                 handler.startPingTimer(interval: interval)
             }
 
@@ -828,6 +862,12 @@ public actor NatsClient {
                 // leaving the client permanently stuck after a reconnect.
                 _ = stateMachine.transition(on: .connect)
 
+                // Same one-attempt budget as the initial connect. Without it a
+                // reconnect that stalls mid-handshake wedges this loop and no
+                // further attempt is ever made — the client stays down for good
+                // even though the policy has attempts left.
+                let deadline = ContinuousClock.now.advanced(by: options.connectTimeout)
+
                 beginHandshake()
                 try await establishConnection()
 
@@ -837,7 +877,7 @@ public actor NatsClient {
                 // frames sent before CONNECT race the handshake and are
                 // dropped by the server. handleInfo() settles this wait once
                 // the session is fully connected.
-                try await waitForHandshake()
+                try await waitForHandshake(timeout: remaining(until: deadline))
 
                 await resubscribeAll()
                 await reconnectionState.reset()
