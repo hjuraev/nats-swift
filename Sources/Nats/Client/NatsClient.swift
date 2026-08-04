@@ -27,6 +27,13 @@ public actor NatsClient {
 
     // NIO components
     private var eventLoopGroup: EventLoopGroup?
+
+    // Whether this client created its event-loop group and is therefore
+    // responsible for shutting it down. A group supplied through
+    // `NatsClientOptions.eventLoopGroup` belongs to the caller: shutting that
+    // one down on close() would take out every other client sharing it, which
+    // is a worse failure than the per-client group it replaces.
+    private let ownsEventLoopGroup: Bool
     private var channel: Channel?
     private var connectionHandler: ConnectionHandler?
 
@@ -71,6 +78,45 @@ public actor NatsClient {
     // Track if TLS is being used for current connection
     private var usingTLS: Bool = false
 
+    // Whether the TLS handshake for the current attempt has actually completed.
+    //
+    // `upgradeToTLS()` returns as soon as the handler is in the pipeline, not
+    // when the handshake finishes — NIOSSL buffers outbound writes until then.
+    // The attempt is already bounded (the connect deadline covers it), but
+    // without this flag a stalled handshake reports a bare "connection timeout",
+    // indistinguishable from a slow TCP connect or a server that never sent
+    // INFO. Knowing which one it was is the difference between a five-minute
+    // diagnosis and a five-day one.
+    private var tlsHandshakeCompleted: Bool = false
+
+    /// Settle-once guard shared by a bounded write's completion, its deadline
+    /// and its cancellation handler. All three run on the same event loop, so
+    /// the lock is only here to satisfy `Sendable`, not for contention.
+    private final class WriteSettleFlag: @unchecked Sendable {
+        private let lock = NSLock()
+        private var settled = false
+
+        /// Returns true to exactly one caller.
+        func claim() -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            if settled { return false }
+            settled = true
+            return true
+        }
+    }
+
+    /// How often a blocked write re-checks whether the connection has drained.
+    private static let writabilityPollInterval: Duration = .milliseconds(5)
+
+    /// Window allowed for in-flight messages to land during `drain()`, capped
+    /// by the caller's `drainTimeout`.
+    private static let drainSettleWindow: Duration = .milliseconds(500)
+
+    /// How long `close()` waits for a cancelled reconnect attempt to stop
+    /// before proceeding without it.
+    private static let reconnectionStopTimeout: Duration = .seconds(2)
+
     // Monotonically increasing connection generation. Bumped on every
     // (re)connection attempt so that callbacks from a superseded channel
     // (a late INFO or channelInactive from a connection we are tearing down)
@@ -83,6 +129,8 @@ public actor NatsClient {
     public init() {
         self.options = NatsClientOptions()
         self.logger = options.logger
+        self.eventLoopGroup = options.eventLoopGroup
+        self.ownsEventLoopGroup = options.eventLoopGroup == nil
         self.inboxPrefix = "\(options.inboxPrefix).\(Subject.randomToken())"
         self.reconnectionState = ReconnectionState(policy: options.reconnect)
     }
@@ -93,6 +141,8 @@ public actor NatsClient {
         configure(&opts)
         self.options = opts
         self.logger = opts.logger
+        self.eventLoopGroup = opts.eventLoopGroup
+        self.ownsEventLoopGroup = opts.eventLoopGroup == nil
         self.inboxPrefix = "\(opts.inboxPrefix).\(Subject.randomToken())"
         self.reconnectionState = ReconnectionState(policy: opts.reconnect)
     }
@@ -101,15 +151,38 @@ public actor NatsClient {
     public init(options: NatsClientOptions) {
         self.options = options
         self.logger = options.logger
+        self.eventLoopGroup = options.eventLoopGroup
+        self.ownsEventLoopGroup = options.eventLoopGroup == nil
         self.inboxPrefix = "\(options.inboxPrefix).\(Subject.randomToken())"
         self.reconnectionState = ReconnectionState(policy: options.reconnect)
+    }
+
+    /// The event-loop group this client is currently using, if any.
+    ///
+    /// Test-only. Exposed so the ownership contract in
+    /// `NatsClientOptions.eventLoopGroup` can be asserted rather than assumed —
+    /// whether `close()` tore a group down is not observable from the public
+    /// surface.
+    internal var eventLoopGroupForTesting: EventLoopGroup? {
+        eventLoopGroup
     }
 
     // MARK: - Connection Lifecycle
 
     /// Connect to the NATS server
     public func connect() async throws(ConnectionError) {
-        guard stateMachine.state == .disconnected || stateMachine.state == .closed else {
+        // `.closed` is terminal in ConnectionStateMachine — no event transitions
+        // out of it. This guard used to admit it, so `transition(on: .connect)`
+        // silently did nothing and the attempt fell through to
+        // `establishConnection()`'s own `.closed` check, surfacing as a bare
+        // "Connection is closed" several frames from the real cause. Say what
+        // actually happened instead.
+        if stateMachine.state == .closed {
+            logger.error("connect() called on a closed client; NatsClient is single-use — create a new instance after close()")
+            throw ConnectionError.closed
+        }
+
+        guard stateMachine.state == .disconnected else {
             logger.warning("Already connected or connecting")
             return
         }
@@ -148,6 +221,7 @@ public actor NatsClient {
         handshakeInFlight = true
         pendingHandshakeResult = nil
         connectContinuation = nil
+        tlsHandshakeCompleted = false
     }
 
     /// Mark the attempt finished and drop any state it left behind.
@@ -201,7 +275,7 @@ public actor NatsClient {
             } catch {
                 return  // cancelled: the handshake already settled
             }
-            await self?.failHandshake(with: ConnectionError.timeout(after: timeout))
+            await self?.failHandshakeOnDeadline(after: timeout)
         }
         defer { timer.cancel() }
 
@@ -220,6 +294,12 @@ public actor NatsClient {
         } onCancel: {
             Task { await self.failHandshake(with: CancellationError()) }
         }
+    }
+
+    /// Fail an in-flight handshake because its deadline expired, naming the
+    /// phase that actually stalled.
+    private func failHandshakeOnDeadline(after timeout: Duration) async {
+        await failHandshake(with: connectDeadlineError(after: timeout))
     }
 
     /// Fail an in-flight handshake wait and tear down the half-open attempt.
@@ -265,14 +345,35 @@ public actor NatsClient {
     public func close() async {
         logger.info("Closing NATS connection")
 
-        // Cancel any ongoing reconnection first
-        reconnectionTask?.cancel()
-        reconnectionTask = nil
+        // Cancel any ongoing reconnection first, and *wait for it to stop*.
+        //
+        // Cancelling without awaiting let a suspended reconnect attempt resume
+        // after `eventLoopGroup` had already been nil'd below, at which point
+        // `establishConnection()` built a fresh group that nothing would ever
+        // shut down — one leaked group and thread per occurrence. The wait is
+        // bounded so a reconnect wedged on a non-cancellable operation delays
+        // close rather than blocking it forever.
+        if let reconnection = reconnectionTask {
+            reconnectionTask = nil
+            reconnection.cancel()
+            await withTaskGroup(of: Void.self) { group in
+                group.addTask { _ = await reconnection.value }
+                group.addTask { try? await Task.sleep(for: Self.reconnectionStopTimeout) }
+                _ = await group.next()
+                group.cancelAll()
+            }
+        }
 
         _ = stateMachine.transition(on: .close)
 
         // Finish all subscriptions
         await subscriptionManager.finishAll()
+
+        // Bump the generation so a fresh connection on this client gets a
+        // working subscription manager. `finishAll()` latches `isClosed`, which
+        // silently discards every later message; without this reset the manager
+        // stayed dead for the lifetime of the client.
+        await subscriptionManager.reopen()
 
         // Cancel pending requests
         for (_, continuation) in pendingRequests {
@@ -288,11 +389,14 @@ public actor NatsClient {
         connectionHandler = nil
         pendingServerOps.removeAll()
 
-        // Shutdown event loop group
-        if let group = eventLoopGroup {
-            try? await group.shutdownGracefully()
+        // Shutdown the event-loop group only if it is ours. An injected group
+        // outlives the client by contract — see NatsClientOptions.eventLoopGroup.
+        if ownsEventLoopGroup {
+            if let group = eventLoopGroup {
+                try? await group.shutdownGracefully()
+            }
+            eventLoopGroup = nil
         }
-        eventLoopGroup = nil
     }
 
     /// Drain subscriptions and close gracefully
@@ -312,18 +416,34 @@ public actor NatsClient {
         logger.info("Draining NATS connection")
         _ = stateMachine.transition(on: .drain)
 
+        // `drainTimeout` bounds the whole drain. It was previously declared,
+        // defaulted and assigned but never read by any code path, while drain
+        // used a hard-coded 500 ms settle window — an advertised timeout that
+        // did nothing.
+        //
+        // Caveat: an individual UNSUB write is still unbounded (see the write
+        // path work), so a wedged socket can overrun this deadline inside one
+        // write. Bounding the loop and the settle window is what can be done
+        // without a bounded-write primitive.
+        let deadline = ContinuousClock.now.advanced(by: options.drainTimeout)
+
         // Get all active subscriptions before we start draining
         let activeSubscriptions = await subscriptionManager.getAllSubscriptions()
 
         // Send UNSUB for all subscriptions to stop receiving new messages from server
         for (sid, _, _, _) in activeSubscriptions {
+            guard ContinuousClock.now < deadline else {
+                logger.warning("Drain timeout reached with subscriptions still to unsubscribe; closing anyway")
+                break
+            }
             try? await write(.unsubscribe(sid: sid, max: nil))
             await subscriptionManager.markDraining(sid: sid)
         }
 
-        // Brief delay to allow in-flight messages to arrive and be delivered
-        // This is much shorter than drainTimeout - just enough for network latency
-        try? await Task.sleep(for: .milliseconds(500))
+        // Brief window for in-flight messages to arrive and be delivered, capped
+        // by whatever is left of the drain budget.
+        let settleWindow = min(Self.drainSettleWindow, remaining(until: deadline))
+        try? await Task.sleep(for: settleWindow)
 
         // Now close the connection - this will finish all subscription continuations
         await close()
@@ -532,9 +652,11 @@ public actor NatsClient {
         }
         self.connectionHandler = nil
 
-        // Reuse the EventLoopGroup across reconnect attempts — it is only
-        // shut down by close(). Creating a fresh group every attempt would
-        // leak a group and its backing thread on each reconnect.
+        // Reuse the EventLoopGroup across reconnect attempts — it is only shut
+        // down by close(), and then only if this client created it. Creating a
+        // fresh group every attempt would leak a group and its backing thread
+        // on each reconnect. An injected group arrives already set on
+        // `eventLoopGroup`, so it takes the reuse branch below.
         let group: EventLoopGroup
         if let existingGroup = eventLoopGroup {
             group = existingGroup
@@ -578,6 +700,10 @@ public actor NatsClient {
             .connectTimeout(TimeAmount(options.connectTimeout))
             .channelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
             .channelOption(ChannelOptions.tcpOption(.tcp_nodelay), value: 1)
+            // What makes `channel.isWritable` meaningful. Without explicit
+            // marks the client had no signal that a peer had stopped reading,
+            // and every frame was queued regardless.
+            .channelOption(ChannelOptions.writeBufferWaterMark, value: options.writeBufferWaterMark)
             .channelInitializer { channel in
                 channel.pipeline.addHandlers([
                     MessageToByteHandler(ProtocolEncoder(logger: protocolLogger)),
@@ -688,9 +814,12 @@ public actor NatsClient {
         // Check for TLS requirement - fail if server requires TLS but we don't want it
         if info.tlsRequired == true && !wantsTLS {
             logger.error("Server requires TLS but client is not configured for it")
-            let error = ConnectionError.tlsRequired
-            settleHandshake(.failure(error))
-            await close()
+            // Tear down the attempt, not the client. Routing this through
+            // close() parked the state machine in the terminal `.closed` state,
+            // so a TLS misconfiguration — or any transient TLS failure —
+            // permanently bricked the instance. Same defect fbf57ab fixed for
+            // cancellation, reached by a different path.
+            await failHandshake(with: ConnectionError.tlsRequired)
             return
         }
 
@@ -702,8 +831,8 @@ public actor NatsClient {
                 logger.info("TLS upgrade successful")
             } catch {
                 logger.error("TLS upgrade failed: \(error)")
-                settleHandshake(.failure(ConnectionError.tlsHandshakeFailed(reason: error.localizedDescription)))
-                await close()
+                // See above: fail the attempt, keep the client usable.
+                await failHandshake(with: ConnectionError.tlsHandshakeFailed(reason: error.localizedDescription))
                 return
             }
         }
@@ -782,6 +911,19 @@ public actor NatsClient {
 
         let sslHandler = try NIOSSLClientHandler(context: sslContext, serverHostname: hostname)
 
+        // Watch for the handshake actually completing. Adding the SSL handler
+        // only *starts* it; everything written before it finishes sits in
+        // NIOSSL's buffer.
+        //
+        // Inserted first and then displaced by the SSL handler, so the pipeline
+        // ends up [ssl, observer, ...] — the observer sits directly downstream
+        // of the handler whose event it is watching for.
+        let generation = connectionGeneration
+        let observer = TLSHandshakeObserver { [weak self] in
+            Task { await self?.markTLSHandshakeCompleted(generation: generation) }
+        }
+        try await channel.pipeline.addHandler(observer, position: .first).get()
+
         // Add TLS handler at the front of the pipeline (before protocol encoder/decoder)
         try await channel.pipeline.addHandler(sslHandler, position: .first).get()
 
@@ -857,6 +999,21 @@ public actor NatsClient {
             reconnectionTask = Task {
                 await attemptReconnection()
             }
+        } else if wasConnected {
+            // Nothing is going to restore this connection. Consumers were left
+            // suspended on `for await msg in subscription` forever — a
+            // subscription that looked alive and could never deliver again.
+            // Silence is the worst possible report, so end the streams.
+            //
+            // Only in this branch: when a reconnect *is* coming, `resubscribeAll`
+            // restores these same subscriptions and finishing them would destroy
+            // the thing being restored.
+            logger.info("Connection lost and reconnection is disabled; finishing all subscriptions")
+            await subscriptionManager.finishAll()
+
+            // Clear the closed latch so a caller who reconnects by hand gets a
+            // working manager rather than one that silently discards everything.
+            await subscriptionManager.reopen()
         }
     }
 
@@ -1047,7 +1204,154 @@ public actor NatsClient {
         guard let channel = channel else {
             throw ConnectionError.closed
         }
-        try await channel.writeAndFlush(op)
+
+        // Refuse before queuing when the connection is saturated.
+        //
+        // This is the recoverable half of bounding writes. Once bytes are handed
+        // to `writeAndFlush` they cannot be un-queued — abandoning a partially
+        // flushed frame would corrupt the stream for every later operation — so
+        // the only safe place to say no is *before* the write. A peer that stops
+        // reading previously turned into unbounded buffering here.
+        if !channel.isWritable {
+            let waited = try await awaitWritable(channel)
+            if !waited {
+                throw ConnectionError.backpressured(after: options.writeBackpressureTimeout)
+            }
+        }
+
+        try await flush(op, on: channel)
+    }
+
+    /// Write one frame with a deadline, honouring cancellation.
+    ///
+    /// `channel.writeAndFlush(op)` alone is unbounded *and* non-cancellable:
+    /// NIO's async bridge awaits the promise, which completes only when the
+    /// bytes reach the socket. Against a peer that accepts and stops reading,
+    /// that promise is never fulfilled — measured: 512 KiB absorbed by the
+    /// kernel, then the next frame parks forever and resolves only when the
+    /// channel is destroyed.
+    ///
+    /// The deadline is enforced by the event loop, because a Swift-side race
+    /// would return while the write stayed pending. Whoever settles first —
+    /// completion, deadline, or cancellation — owns the outcome.
+    ///
+    /// **Abandoning a write closes the connection.** Bytes already handed to
+    /// the channel cannot be recalled, so a frame abandoned midway leaves the
+    /// stream desynchronised; every later operation would land at a boundary
+    /// the server no longer agrees with. Tearing down is the price of bounding
+    /// a write at all, and it has a useful side effect: closing fails the
+    /// orphaned promise, so the abandoned write does not leak.
+    private func flush(_ op: ClientOp, on channel: Channel) async throws {
+        let timeout = options.writeTimeout
+        let eventLoop = channel.eventLoop
+        let outcome = eventLoop.makePromise(of: Void.self)
+        let settled = WriteSettleFlag()
+
+        let deadline = eventLoop.scheduleTask(in: TimeAmount(timeout)) {
+            guard settled.claim() else { return }
+            outcome.fail(ConnectionError.writeTimedOut(after: timeout))
+        }
+
+        channel.writeAndFlush(op).whenComplete { result in
+            guard settled.claim() else { return }
+            deadline.cancel()
+            outcome.completeWith(result)
+        }
+
+        do {
+            try await withTaskCancellationHandler {
+                try await outcome.futureResult.get()
+            } onCancel: {
+                eventLoop.execute {
+                    guard settled.claim() else { return }
+                    deadline.cancel()
+                    outcome.fail(CancellationError())
+                }
+            }
+        } catch {
+            if Self.abandonsFrame(error) {
+                await tearDownAbandonedWrite(channel)
+            }
+            throw error
+        }
+    }
+
+    /// Record that the current attempt's TLS handshake finished.
+    private func markTLSHandshakeCompleted(generation: UInt64) {
+        guard generation == connectionGeneration else { return }
+        tlsHandshakeCompleted = true
+        logger.debug("TLS handshake completed")
+    }
+
+    /// The error to report when the connect deadline expires.
+    ///
+    /// Attribution, not boundedness: the deadline already fires correctly. But
+    /// "connection timeout" covers a stalled TCP connect, a server that never
+    /// sent INFO, and a TLS peer that never answered the ClientHello — three
+    /// very different things to go and look at.
+    private func connectDeadlineError(after timeout: Duration) -> ConnectionError {
+        if usingTLS && !tlsHandshakeCompleted {
+            return .tlsHandshakeFailed(
+                reason: "TLS handshake did not complete within \(timeout)"
+            )
+        }
+        return .timeout(after: timeout)
+    }
+
+    /// Whether this failure means a frame was abandoned mid-flight, as opposed
+    /// to never having been handed over or having failed outright.
+    private static func abandonsFrame(_ error: any Error) -> Bool {
+        if error is CancellationError { return true }
+        if let connectionError = error as? ConnectionError,
+           case .writeTimedOut = connectionError {
+            return true
+        }
+        return false
+    }
+
+    /// Close the connection a frame was abandoned on.
+    ///
+    /// Deliberately closes the *channel* rather than calling `close()`: the
+    /// latter parks the state machine in the terminal `.closed` state and would
+    /// make the client permanently unusable. Closing the channel routes through
+    /// `handleConnectionClose`, which returns the state to `.disconnected` and
+    /// starts reconnection when it is enabled.
+    private func tearDownAbandonedWrite(_ channel: Channel) async {
+        guard self.channel === channel else {
+            return  // already replaced by a newer attempt; nothing to tear down
+        }
+
+        logger.error("Abandoned an in-flight write; closing the connection because a partly flushed frame leaves the stream unusable")
+        try? await channel.close()
+    }
+
+    /// Wait for a saturated connection to drain, up to `writeBackpressureTimeout`.
+    ///
+    /// Polls rather than waiting on a writability event. That is a deliberate
+    /// trade: this path only runs when the connection is *already* blocked, so
+    /// the poll interval is noise next to the stall it is measuring, and it
+    /// avoids a second continuation handoff — the exact machinery that produced
+    /// the lost-wakeup and double-resume bugs on the handshake path.
+    ///
+    /// Returns false if the connection never became writable in time.
+    private func awaitWritable(_ channel: Channel) async throws -> Bool {
+        let deadline = ContinuousClock.now.advanced(by: options.writeBackpressureTimeout)
+        logger.debug("Connection is saturated; waiting for it to drain before writing")
+
+        while ContinuousClock.now < deadline {
+            try Task.checkCancellation()
+
+            // A connection that dies while we wait must fail the write rather
+            // than spin out the full timeout.
+            guard self.channel === channel else {
+                throw ConnectionError.closed
+            }
+            if channel.isWritable {
+                return true
+            }
+            try await Task.sleep(for: Self.writabilityPollInterval)
+        }
+        return channel.isWritable
     }
 }
 

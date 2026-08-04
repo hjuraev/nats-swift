@@ -32,6 +32,54 @@ public struct KeyValueWatchOptions: Sendable {
     }
 }
 
+/// Owns the pump task and continuation behind a watcher, so the watcher can
+/// actually be stopped.
+///
+/// `stop()` used to delete the consumer and nothing else: the pump kept looping
+/// and the stream was never finished, so anyone iterating the watcher stayed
+/// suspended indefinitely on a watcher they had explicitly stopped.
+final class KeyValueWatcherHandle: @unchecked Sendable {
+    private let lock = NSLock()
+    private var pump: Task<Void, Never>?
+    private var continuation: AsyncThrowingStream<KeyValueEntry?, Error>.Continuation?
+    private var stopped = false
+
+    func arm(continuation: AsyncThrowingStream<KeyValueEntry?, Error>.Continuation) {
+        lock.lock(); defer { lock.unlock() }
+        self.continuation = continuation
+    }
+
+    func arm(pump: Task<Void, Never>) {
+        lock.lock()
+        let alreadyStopped = stopped
+        if !alreadyStopped { self.pump = pump }
+        lock.unlock()
+        // Stopped before the pump was even attached — do not leave it running.
+        if alreadyStopped { pump.cancel() }
+    }
+
+    /// Cancel the pump and end the stream. Idempotent.
+    func stop() {
+        lock.lock()
+        if stopped {
+            lock.unlock()
+            return
+        }
+        stopped = true
+        let pump = self.pump
+        let continuation = self.continuation
+        self.pump = nil
+        self.continuation = nil
+        lock.unlock()
+
+        pump?.cancel()
+        // Finish directly rather than waiting for the pump to notice: it may be
+        // parked in a multi-second fetch, and a stopped watcher should not make
+        // its consumer wait that out.
+        continuation?.finish()
+    }
+}
+
 /// An async sequence that yields KV entry updates.
 /// A nil element signals that all initial values have been delivered.
 public struct KeyValueWatcher: AsyncSequence, Sendable {
@@ -41,17 +89,20 @@ public struct KeyValueWatcher: AsyncSequence, Sendable {
     private let consumerName: String
     private let streamName: String
     private let context: JetStreamContext
+    private let handle: KeyValueWatcherHandle
 
     init(
         stream: AsyncThrowingStream<KeyValueEntry?, Error>,
         consumerName: String,
         streamName: String,
-        context: JetStreamContext
+        context: JetStreamContext,
+        handle: KeyValueWatcherHandle
     ) {
         self.stream = stream
         self.consumerName = consumerName
         self.streamName = streamName
         self.context = context
+        self.handle = handle
     }
 
     public struct AsyncIterator: AsyncIteratorProtocol {
@@ -66,8 +117,13 @@ public struct KeyValueWatcher: AsyncSequence, Sendable {
         AsyncIterator(base: stream.makeAsyncIterator())
     }
 
-    /// Stop the watcher and clean up the consumer.
+    /// Stop the watcher, end its stream, and clean up the consumer.
+    ///
+    /// Ending the stream is the part that used to be missing: deleting the
+    /// consumer stops new data arriving but says nothing to anyone already
+    /// iterating, who would wait for a message that could never come.
     public func stop() async throws(JetStreamError) {
+        handle.stop()
         do {
             try await context.deleteConsumer(stream: streamName, consumer: consumerName)
         } catch {
@@ -116,8 +172,15 @@ public struct KeyValueWatcher: AsyncSequence, Sendable {
         let consumerName = await consumer.name
         let initialPending = await consumer.info.numPending
 
+        let handle = KeyValueWatcherHandle()
         let asyncStream = AsyncThrowingStream<KeyValueEntry?, Error> { continuation in
-            Task {
+            handle.arm(continuation: continuation)
+
+            // A consumer that simply stops iterating must not leave the pump
+            // fetching forever behind it.
+            continuation.onTermination = { _ in handle.stop() }
+
+            let pump = Task {
                 var received: UInt64 = 0
                 var sentInitialDone = options.updatesOnly  // If updatesOnly, skip initial done sentinel
 
@@ -150,13 +213,15 @@ public struct KeyValueWatcher: AsyncSequence, Sendable {
 
                 continuation.finish()
             }
+            handle.arm(pump: pump)
         }
 
         return KeyValueWatcher(
             stream: asyncStream,
             consumerName: consumerName,
             streamName: streamName,
-            context: context
+            context: context,
+            handle: handle
         )
     }
 }

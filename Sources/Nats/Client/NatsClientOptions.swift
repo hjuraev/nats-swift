@@ -4,6 +4,7 @@
 
 import Foundation
 import Logging
+import NIOCore
 
 /// Configuration options for NatsClient
 public struct NatsClientOptions: Sendable {
@@ -57,6 +58,49 @@ public struct NatsClientOptions: Sendable {
     /// Custom inbox prefix
     public var inboxPrefix: String
 
+    /// Outbound buffer thresholds at which the connection reports itself
+    /// unwritable and writable again.
+    ///
+    /// The client checks `channel.isWritable` before every frame, so these
+    /// bounds are what stop a peer that stops reading from turning into
+    /// unbounded memory growth on this side.
+    public var writeBufferWaterMark: WriteBufferWaterMark
+
+    /// How long a write waits for a saturated connection to drain before being
+    /// refused with `ConnectionError.backpressured`.
+    ///
+    /// Refusing is safe: nothing has been queued, so the caller can retry. This
+    /// is deliberately *not* a deadline on a write already in flight — that one
+    /// cannot be undone once the bytes are handed to the channel.
+    public var writeBackpressureTimeout: Duration
+
+    /// How long a single frame may take to reach the socket before it is
+    /// abandoned and **the connection is closed**.
+    ///
+    /// Closing is not optional. Bytes handed to the channel cannot be recalled,
+    /// so a frame abandoned midway leaves the stream desynchronised — every
+    /// later operation on that connection would land at a frame boundary the
+    /// server no longer agrees with. Bounding a write therefore costs the
+    /// connection; reconnection (when enabled) rebuilds it.
+    ///
+    /// The default is generous on purpose. NATS caps a single frame at the
+    /// server's `max_payload` (commonly 1 MiB), so a frame that cannot reach
+    /// the socket in 30s indicates a dead peer rather than a slow one. Raise it
+    /// if you run unusually large payloads over unusually slow links.
+    public var writeTimeout: Duration
+
+    /// Event-loop group to run this client's connection on.
+    ///
+    /// `nil` (the default) means the client creates and owns a single-threaded
+    /// group of its own. That is fine for one client, but N clients in a process
+    /// then cost N groups and N threads — supply a shared group here to make
+    /// them cost N channels instead.
+    ///
+    /// **Ownership:** a group supplied here is never shut down by `close()`;
+    /// the caller keeps that responsibility. Only a group the client created
+    /// for itself is torn down with the client.
+    public var eventLoopGroup: (any EventLoopGroup)?
+
     public init(
         servers: [URL] = [URL(string: "nats://localhost:4222")!],
         name: String? = nil,
@@ -73,7 +117,11 @@ public struct NatsClientOptions: Sendable {
         pedantic: Bool = false,
         maxPayload: Int = 0,
         logger: Logger = Logger(label: "nats.client"),
-        inboxPrefix: String = "_INBOX"
+        inboxPrefix: String = "_INBOX",
+        writeBufferWaterMark: WriteBufferWaterMark = WriteBufferWaterMark(low: 32 * 1024, high: 64 * 1024),
+        writeBackpressureTimeout: Duration = .seconds(5),
+        writeTimeout: Duration = .seconds(30),
+        eventLoopGroup: (any EventLoopGroup)? = nil
     ) {
         self.servers = servers
         self.name = name
@@ -91,6 +139,10 @@ public struct NatsClientOptions: Sendable {
         self.maxPayload = maxPayload
         self.logger = logger
         self.inboxPrefix = inboxPrefix
+        self.writeBufferWaterMark = writeBufferWaterMark
+        self.writeBackpressureTimeout = writeBackpressureTimeout
+        self.writeTimeout = writeTimeout
+        self.eventLoopGroup = eventLoopGroup
     }
 }
 

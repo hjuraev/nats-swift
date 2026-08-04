@@ -30,6 +30,23 @@ public enum ConnectionError: NatsErrorProtocol, Hashable {
     /// Connection is closed
     case closed
 
+    /// The connection's outbound buffer stayed full for longer than
+    /// `writeBackpressureTimeout`, so the write was refused rather than queued.
+    ///
+    /// Distinct from `timeout` on purpose: nothing was written, so this is safe
+    /// to retry on the same connection once it drains. A write that has already
+    /// been handed to the channel cannot make that promise.
+    case backpressured(after: Duration)
+
+    /// A write did not reach the socket within `writeTimeout`, so the frame was
+    /// abandoned and the connection torn down.
+    ///
+    /// Unlike `backpressured`, this frame may have been *partially* written.
+    /// Bytes already handed to the channel cannot be recalled, and a stream
+    /// carrying half a frame cannot be reused — so the connection goes with it.
+    /// Treat the operation's outcome as unknown, not as "did not happen".
+    case writeTimedOut(after: Duration)
+
     /// Connection is draining
     case draining
 
@@ -66,6 +83,10 @@ public enum ConnectionError: NatsErrorProtocol, Hashable {
             return "Connection timeout after \(duration)"
         case .closed:
             return "Connection is closed"
+        case .backpressured(let duration):
+            return "Connection outbound buffer stayed full for \(duration); write refused, nothing was sent"
+        case .writeTimedOut(let duration):
+            return "Write did not reach the socket within \(duration); frame abandoned and connection closed"
         case .draining:
             return "Connection is draining"
         case .dnsResolutionFailed(let host):

@@ -381,6 +381,20 @@ public actor JetStreamContext {
             var messages: [JetStreamMessage] = []
             let deadline = ContinuousClock.now + effectiveExpires
 
+            // Enforce the deadline on the *iteration*, not just between messages.
+            //
+            // The in-loop check below only runs once a message has arrived, so a
+            // consumer that stays silent — a pull request lost in a reconnect
+            // window, for instance — left this `for await` suspended forever and
+            // `expires` did nothing. Unsubscribing finishes the stream, which
+            // ends the loop; it is the same teardown the happy path performs, so
+            // there is no second mechanism to keep correct.
+            let expiry = Task {
+                try? await Task.sleep(for: effectiveExpires)
+                await subscription.unsubscribe()
+            }
+            defer { expiry.cancel() }
+
             // Collect messages until batch is filled, timeout, or terminal status
             for await msg in subscription {
                 // Check for status headers (404 No Messages, 408 Timeout, 409 Exceeded MaxRequestBatch)
