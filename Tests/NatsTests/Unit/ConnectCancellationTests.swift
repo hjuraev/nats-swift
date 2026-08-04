@@ -4,90 +4,18 @@
 
 import Foundation
 import Testing
-import NIOCore
-import NIOPosix
 @testable import Nats
-
-/// A TCP listener that accepts connections and then says nothing — no INFO
-/// frame, ever.
-///
-/// This is the only state in which `connect()` reaches its handshake wait and
-/// stays there: the socket is healthy and established, so no close event
-/// arrives to fail the attempt. A refused connection fails earlier, inside
-/// `establishConnection()`, and never gets that far.
-private final class SilentServer: Sendable {
-    private let group: MultiThreadedEventLoopGroup
-    private let channel: Channel
-    let port: Int
-
-    private init(group: MultiThreadedEventLoopGroup, channel: Channel, port: Int) {
-        self.group = group
-        self.channel = channel
-        self.port = port
-    }
-
-    static func start() async throws -> SilentServer {
-        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
-        let channel = try await ServerBootstrap(group: group)
-            .serverChannelOption(ChannelOptions.backlog, value: 16)
-            .serverChannelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
-            .bind(host: "127.0.0.1", port: 0)
-            .get()
-
-        guard let port = channel.localAddress?.port else {
-            try? await channel.close()
-            try? await group.shutdownGracefully()
-            throw ConnectionError.noServersAvailable
-        }
-        return SilentServer(group: group, channel: channel, port: port)
-    }
-
-    func stop() async {
-        try? await channel.close()
-        try? await group.shutdownGracefully()
-    }
-}
-
-/// Records a task's outcome without anyone having to `await` that task.
-///
-/// This matters more than it looks. `await task.value` / `await task.result`
-/// are NOT cancellation-responsive — cancelling the waiter does not resume it.
-/// A test that awaited the connect task directly would therefore *hang* on a
-/// regression rather than fail, and `.timeLimit` could not rescue it either,
-/// because the time limit is itself delivered as cancellation. Polling this box
-/// keeps a regression to a 5-second failure.
-private final class OutcomeBox: @unchecked Sendable {
-    private let lock = NSLock()
-    private var outcome: Result<Void, any Error>?
-
-    func set(_ value: Result<Void, any Error>) {
-        lock.lock(); defer { lock.unlock() }
-        if outcome == nil { outcome = value }
-    }
-
-    var value: Result<Void, any Error>? {
-        lock.lock(); defer { lock.unlock() }
-        return outcome
-    }
-
-    /// Wait up to `timeout` for an outcome, without awaiting the task itself.
-    func wait(upTo timeout: Duration) async -> Result<Void, any Error>? {
-        let deadline = ContinuousClock().now.advanced(by: timeout)
-        while ContinuousClock().now < deadline {
-            if let value { return value }
-            try? await Task.sleep(for: .milliseconds(20))
-        }
-        return value
-    }
-}
 
 @Suite("Connect Cancellation Tests")
 struct ConnectCancellationTests {
 
-    private func makeStalledClient(_ server: SilentServer) -> NatsClient {
+    private func makeStalledClient(_ peer: StalledPeer) -> NatsClient {
         NatsClient {
-            $0.servers = [URL(string: "nats://127.0.0.1:\(server.port)")!]
+            $0.servers = [peer.url]
             $0.reconnect = .disabled
+            // Long enough that the client's own deadline cannot be what ends
+            // these waits — cancellation has to be doing the work.
+            $0.connectTimeout = .seconds(3600)
         }
     }
 
@@ -97,19 +25,14 @@ struct ConnectCancellationTests {
     /// boot does exactly that) was left holding a task that could never finish.
     @Test("Cancelling a stalled connect unwinds instead of hanging", .timeLimit(.minutes(1)))
     func cancelledConnectUnwinds() async throws {
-        let server = try await SilentServer.start()
-        defer { Task { await server.stop() } }
+        let peer = try await StalledPeer.start(.silent)
+        defer { Task { await peer.stop() } }
 
-        let client = makeStalledClient(server)
-        let outcome = OutcomeBox()
+        let client = makeStalledClient(peer)
+        let outcome = ResultBox<OperationOutcome>()
 
         let connectTask = Task {
-            do {
-                try await client.connect()
-                outcome.set(.success(()))
-            } catch {
-                outcome.set(.failure(error))
-            }
+            outcome.set(await OperationOutcome { try await client.connect() })
         }
 
         // Let it get past the TCP connect and park on the handshake wait.
@@ -118,16 +41,16 @@ struct ConnectCancellationTests {
 
         connectTask.cancel()
 
-        let result = await outcome.wait(upTo: .seconds(5))
+        let deadline = ContinuousClock().now.advanced(by: .seconds(5))
+        while ContinuousClock().now < deadline && outcome.value == nil {
+            try await Task.sleep(for: .milliseconds(20))
+        }
 
-        guard let result else {
+        guard let result = outcome.value else {
             Issue.record("cancelled connect did not unwind within 5s — it is hung")
             return
         }
-        guard case .failure = result else {
-            Issue.record("expected a cancelled connect to throw, got success")
-            return
-        }
+        #expect(result.isFailure, "expected a cancelled connect to throw, got \(result)")
     }
 
     /// The abandoned attempt must not be left running — but it must also not
@@ -142,25 +65,24 @@ struct ConnectCancellationTests {
     /// would poison its own client on the first timeout.
     @Test("A cancelled connect leaves the client retryable, not closed", .timeLimit(.minutes(1)))
     func cancelledConnectLeavesClientRetryable() async throws {
-        let server = try await SilentServer.start()
-        defer { Task { await server.stop() } }
+        let peer = try await StalledPeer.start(.silent)
+        defer { Task { await peer.stop() } }
 
-        let client = makeStalledClient(server)
-        let outcome = OutcomeBox()
+        let client = makeStalledClient(peer)
+        let outcome = ResultBox<OperationOutcome>()
 
         let connectTask = Task {
-            do {
-                try await client.connect()
-                outcome.set(.success(()))
-            } catch {
-                outcome.set(.failure(error))
-            }
+            outcome.set(await OperationOutcome { try await client.connect() })
         }
 
         try await Task.sleep(for: .milliseconds(300))
         connectTask.cancel()
 
-        guard await outcome.wait(upTo: .seconds(5)) != nil else {
+        let deadline = ContinuousClock().now.advanced(by: .seconds(5))
+        while ContinuousClock().now < deadline && outcome.value == nil {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        guard outcome.value != nil else {
             Issue.record("cancelled connect did not unwind within 5s — it is hung")
             return
         }
@@ -178,24 +100,15 @@ struct ConnectCancellationTests {
         )
 
         // The real property: a second attempt must actually be attempted, not
-        // rejected out of hand. It still cannot succeed against a silent server,
+        // rejected out of hand. It still cannot succeed against a silent peer,
         // so it should reach the handshake wait and stay there rather than
         // failing instantly off the `.closed` guard.
-        let retry = OutcomeBox()
-        let retryTask = Task {
-            do {
-                try await client.connect()
-                retry.set(.success(()))
-            } catch {
-                retry.set(.failure(error))
-            }
+        let retry = await boundedly(.seconds(1)) {
+            await OperationOutcome { try await client.connect() }
         }
-        defer { retryTask.cancel() }
-
-        let settled = await retry.wait(upTo: .seconds(1))
         #expect(
-            settled == nil,
-            "retry after a cancelled connect should reach the handshake wait, not fail immediately"
+            retry == nil,
+            "retry after a cancelled connect should reach the handshake wait, not fail immediately: \(String(describing: retry))"
         )
     }
 }

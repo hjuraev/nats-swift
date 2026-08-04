@@ -8,7 +8,7 @@ import Foundation
 
 /// Load-shaped coverage for the connect handshake.
 ///
-/// The bug these guard against only appears under a burst: a single connect in
+/// The bug this guards against only appears under a burst: a single connect in
 /// isolation practically never loses the race, which is why every existing
 /// suite passed while a downstream service saw ~20 failures per combined run.
 @Suite("Concurrent Connect Tests", .serialized)
@@ -32,36 +32,16 @@ struct ConcurrentConnectTests {
         }
         defer { server.stop() }
 
-        let url = URL(string: "nats://127.0.0.1:\(server.port)")!
-        let clientCount = 60
-
-        let failures = await withTaskGroup(of: String?.self) { group in
-            for _ in 0..<clientCount {
-                group.addTask {
-                    let client = NatsClient {
-                        $0.servers = [url]
-                        $0.reconnect = .disabled
-                    }
-                    defer { Task { await client.close() } }
-                    do {
-                        try await client.connect()
-                        return nil
-                    } catch {
-                        return "\(error)"
-                    }
-                }
-            }
-
-            var collected: [String] = []
-            for await failure in group {
-                if let failure { collected.append(failure) }
-            }
-            return collected
+        let outcome = await BurstHarness.run(
+            count: 60,
+            against: URL(string: "nats://127.0.0.1:\(server.port)")!
+        ) { client in
+            try await client.connect()
         }
 
         #expect(
-            failures.isEmpty,
-            "\(failures.count)/\(clientCount) concurrent connects failed: \(Set(failures))"
+            outcome.isClean,
+            "\(outcome.failures.count)/\(outcome.total) concurrent connects failed: \(outcome.summary)"
         )
     }
 }

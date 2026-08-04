@@ -220,6 +220,18 @@ actor SubscriptionManager {
         isClosed = true
     }
 
+    /// Clear the closed latch so this manager can serve a new connection.
+    ///
+    /// `finishAll()` sets `isClosed`, which makes `deliver` silently discard
+    /// every message from then on. Nothing ever cleared it, so once a client had
+    /// closed — or merely finished a drain — its subscription manager was dead
+    /// for the lifetime of the process, and any subscription created afterwards
+    /// received nothing while looking perfectly healthy.
+    func reopen() {
+        isClosed = false
+        drainingSubscriptions.removeAll()
+    }
+
     /// Count of active subscriptions
     var count: Int {
         subscriptions.filter { !$0.value.isDraining }.count
