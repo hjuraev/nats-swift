@@ -53,6 +53,11 @@ public actor NatsClient {
     // not parked and mis-delivered to some later connect().
     private var handshakeInFlight: Bool = false
 
+    // Server frames that arrived before `establishConnection` had assigned
+    // `self.channel`. The pipeline is wired before the connect future resolves,
+    // so a fast server's INFO can beat the assignment to the actor.
+    private var pendingServerOps: [ServerOp] = []
+
     // Handshake outcome that arrived before its waiter did. The INFO handler
     // runs on its own task, so it can in principle reach the resume point
     // before connect() has stored its continuation; parking the result here
@@ -281,6 +286,7 @@ public actor NatsClient {
         }
         channel = nil
         connectionHandler = nil
+        pendingServerOps.removeAll()
 
         // Shutdown event loop group
         if let group = eventLoopGroup {
@@ -516,6 +522,7 @@ public actor NatsClient {
         // it emits while we tear it down is ignored (see handleConnection*).
         connectionGeneration &+= 1
         let generation = connectionGeneration
+        pendingServerOps.removeAll()
 
         // Close the previous connection's channel so a dropped or
         // failed-handshake socket isn't left dangling on the event loop.
@@ -583,6 +590,7 @@ public actor NatsClient {
             let channel = try await bootstrap.connect(host: host, port: port).get()
             self.channel = channel
             logger.info("TCP connection established to \(host):\(port)")
+            await drainPendingServerOps()
         } catch {
             throw ConnectionError.connectionRefused(host: host, port: port)
         }
@@ -593,6 +601,33 @@ public actor NatsClient {
         // channel being torn down during reconnect).
         guard generation == connectionGeneration else { return }
 
+        // `establishConnection` installs this handler in the pipeline *before*
+        // `bootstrap.connect()` resolves and assigns `self.channel`, so on a
+        // fast or loaded connection the server's INFO can reach the actor while
+        // the client still has no channel to answer on. Acting on it there made
+        // the CONNECT write fail `write()`'s own nil-channel guard and surface
+        // as "Failed to send CONNECT: Connection is closed" — a client-side
+        // race misreported as the server hanging up. Park the frame; assigning
+        // the channel drains this queue in order.
+        if channel == nil && handshakeInFlight {
+            pendingServerOps.append(op)
+            return
+        }
+
+        await process(op)
+    }
+
+    /// Deliver frames that arrived before the channel was registered.
+    private func drainPendingServerOps() async {
+        guard !pendingServerOps.isEmpty else { return }
+        let queued = pendingServerOps
+        pendingServerOps.removeAll()
+        for op in queued {
+            await process(op)
+        }
+    }
+
+    private func process(_ op: ServerOp) async {
         switch op {
         case .info(let serverInfo):
             await handleInfo(serverInfo)
