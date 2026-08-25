@@ -287,16 +287,18 @@ public actor JetStreamContext {
                 )
             }
 
-            // Check for no responders
+            // Defensive only: `NatsClient.handleMessage` intercepts the 503 and
+            // resumes the request by throwing `ProtocolError.noResponders`, so a
+            // no-responders reply does not reach this point today. `mapping`
+            // handles the live path. Kept so the check still holds if the client
+            // ever delivers the 503 as a normal message.
             if let headers = response.headers, headers.isNoResponders {
                 throw JetStreamError.notEnabled
             }
 
             return response
-        } catch let error as JetStreamError {
-            throw error
         } catch {
-            throw JetStreamError.timeout(operation: "request", after: timeout)
+            throw JetStreamError.mapping(error, operation: "request", timeout: timeout)
         }
     }
 
@@ -316,10 +318,8 @@ public actor JetStreamContext {
             }
 
             return response
-        } catch let error as JetStreamError {
-            throw error
         } catch {
-            throw JetStreamError.timeout(operation: "rawRequest", after: timeout)
+            throw JetStreamError.mapping(error, operation: "rawRequest", timeout: timeout)
         }
     }
 
@@ -337,16 +337,18 @@ public actor JetStreamContext {
                 )
             }
 
-            // Check for no responders
+            // Defensive only: `NatsClient.handleMessage` intercepts the 503 and
+            // resumes the request by throwing `ProtocolError.noResponders`, so a
+            // no-responders reply does not reach this point today. `mapping`
+            // handles the live path. Kept so the check still holds if the client
+            // ever delivers the 503 as a normal message.
             if let headers = response.headers, headers.isNoResponders {
                 throw JetStreamError.notEnabled
             }
 
             return response
-        } catch let error as JetStreamError {
-            throw error
         } catch {
-            throw JetStreamError.timeout(operation: "request", after: timeout)
+            throw JetStreamError.mapping(error, operation: "request", timeout: timeout)
         }
     }
 
@@ -542,8 +544,12 @@ extension NatsClient {
         prefix: String = "$JS.API",
         timeout: Duration = .seconds(5)
     ) async throws(JetStreamError) -> JetStreamContext {
+        // `.notConnected`, NOT `.notEnabled`. This guard fires whenever the
+        // client is not in `.connected` — including every reconnect window —
+        // and reporting that as "JetStream is not enabled" invites callers to
+        // cache a permanent verdict from a transient blip.
         guard state.canAcceptOperations else {
-            throw .notEnabled
+            throw .notConnected
         }
 
         return JetStreamContext(client: self, prefix: prefix, timeout: timeout)
