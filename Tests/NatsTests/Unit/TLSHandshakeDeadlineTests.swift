@@ -93,9 +93,9 @@ struct TLSHandshakeDeadlineTests {
     /// pipeline of every one of them.
     @Test("A real TLS connection still succeeds", .timeLimit(.minutes(1)))
     func realTLSConnectionStillWorks() async throws {
-        // The CI environment runs a TLS-capable server on 4222 with certs in
-        // .github/certs; skip when it is not up rather than fail spuriously.
-        guard await Self.portIsOpen(4222) else { return }
+        // CI runs `.github/nats-server.conf` on 4222 — TLS with `allow_non_tls`.
+        // Skip when that is not what is listening, rather than fail spuriously.
+        guard await Self.serverOffersTLS(port: 4222) else { return }
 
         var options = NatsClientOptions(servers: [URL(string: "nats://127.0.0.1:4222")!])
         options.reconnect = .disabled
@@ -117,18 +117,39 @@ struct TLSHandshakeDeadlineTests {
         #expect(connected, "client should be connected over TLS")
     }
 
-    private static func portIsOpen(_ port: Int) async -> Bool {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/nc")
-        process.arguments = ["-z", "127.0.0.1", String(port)]
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
+    /// Whether the server on `port` actually offers TLS.
+    ///
+    /// The previous precondition only checked that *something* was listening on
+    /// 4222. Any plaintext NATS there — a local dev server, another project's
+    /// container — satisfied it, and the TLS connect then failed the handshake
+    /// with WRONG_VERSION_NUMBER. That reported a TLS regression in the client
+    /// when the only problem was which server happened to hold the port.
+    ///
+    /// Ask the server instead of guessing. NATS sends INFO before any TLS
+    /// upgrade, so a plaintext probe reveals the capability directly. A
+    /// TLS-*required* server (no `allow_non_tls`) refuses the plaintext probe,
+    /// so this errs toward skipping the test rather than toward a false failure.
+    private static func serverOffersTLS(port: Int) async -> Bool {
+        guard let url = URL(string: "nats://127.0.0.1:\(port)") else { return false }
+
+        var options = NatsClientOptions(servers: [url])
+        options.reconnect = .disabled
+        options.connectTimeout = .seconds(2)
+        options.tls.enabled = false
+
+        // Closed deterministically, NOT via `defer { Task { ... } }`. That idiom
+        // only schedules the close, so the probe's connection (and its ping
+        // timer) outlives this helper and competes with the rest of the suite.
+        let probe = NatsClient(options: options)
         do {
-            try process.run()
-            process.waitUntilExit()
-            return process.terminationStatus == 0
+            try await probe.connect()
         } catch {
+            await probe.close()
             return false
         }
+
+        let info = await probe.serverInfo
+        await probe.close()
+        return info?.tlsAvailable == true || info?.tlsRequired == true
     }
 }
