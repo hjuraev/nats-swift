@@ -21,6 +21,8 @@ public actor NatsClient {
     private struct PendingRequest {
         let continuation: CheckedContinuation<NatsMessage, any Error>
         let requestSubject: String
+        /// Fires the request's timeout; cancelled when the reply arrives.
+        let timer: Task<Void, Never>
     }
 
     private var pendingRequests: [String: PendingRequest] = [:]
@@ -37,13 +39,25 @@ public actor NatsClient {
     private var channel: Channel?
     private var connectionHandler: ConnectionHandler?
 
+    /// Frames waiting for `channel`, flushed in batches. Replaced with the channel.
+    private var outbound: OutboundQueue?
+
     // Counters using Swift 6 Atomics
     private let _messagesSent = Atomic<UInt64>(0)
     private let _messagesReceived = Atomic<UInt64>(0)
 
-    // Inbox for request-reply
-    private var inboxSubscription: Subscription?
+    // Inbox for request-reply.
+    //
+    // Set up once and shared by every request. Held as a task so concurrent
+    // first requests wait for the same SUB rather than each subscribing: the
+    // old check-then-await let every request that arrived before the first
+    // SUB returned add another `_INBOX.>` subscription, and the server then
+    // delivered each reply once per duplicate.
+    private var inboxSetup: Task<Void, any Error>?
     private var inboxPrefix: String
+
+    /// `inboxPrefix` plus the separator, precomputed for the per-message check.
+    private let inboxReplyPrefix: String
 
     // Reconnection state
     private var reconnectionState: ReconnectionState
@@ -59,6 +73,10 @@ public actor NatsClient {
     // Gates `settleHandshake` so a close event arriving outside an attempt is
     // not parked and mis-delivered to some later connect().
     private var handshakeInFlight: Bool = false
+
+    // Whether the current attempt has already taken its INFO. Only that first
+    // INFO starts the handshake; any later one is an async update.
+    private var handshakeInfoReceived: Bool = false
 
     // Server frames that arrived before `establishConnection` had assigned
     // `self.channel`. The pipeline is wired before the connect future resolves,
@@ -89,29 +107,15 @@ public actor NatsClient {
     // diagnosis and a five-day one.
     private var tlsHandshakeCompleted: Bool = false
 
-    /// Settle-once guard shared by a bounded write's completion, its deadline
-    /// and its cancellation handler. All three run on the same event loop, so
-    /// the lock is only here to satisfy `Sendable`, not for contention.
-    private final class WriteSettleFlag: @unchecked Sendable {
-        private let lock = NSLock()
-        private var settled = false
-
-        /// Returns true to exactly one caller.
-        func claim() -> Bool {
-            lock.lock()
-            defer { lock.unlock() }
-            if settled { return false }
-            settled = true
-            return true
-        }
-    }
-
     /// How often a blocked write re-checks whether the connection has drained.
     private static let writabilityPollInterval: Duration = .milliseconds(5)
 
     /// Window allowed for in-flight messages to land during `drain()`, capped
     /// by the caller's `drainTimeout`.
     private static let drainSettleWindow: Duration = .milliseconds(500)
+
+    /// How long `close()` waits for queued frames to reach the socket.
+    private static let closeFlushWindow: Duration = .seconds(1)
 
     /// How long `close()` waits for a cancelled reconnect attempt to stop
     /// before proceeding without it.
@@ -131,7 +135,9 @@ public actor NatsClient {
         self.logger = options.logger
         self.eventLoopGroup = options.eventLoopGroup
         self.ownsEventLoopGroup = options.eventLoopGroup == nil
-        self.inboxPrefix = "\(options.inboxPrefix).\(Subject.randomToken())"
+        let inboxPrefix = "\(options.inboxPrefix).\(Subject.randomToken())"
+        self.inboxPrefix = inboxPrefix
+        self.inboxReplyPrefix = inboxPrefix + "."
         self.reconnectionState = ReconnectionState(policy: options.reconnect)
     }
 
@@ -143,7 +149,9 @@ public actor NatsClient {
         self.logger = opts.logger
         self.eventLoopGroup = opts.eventLoopGroup
         self.ownsEventLoopGroup = opts.eventLoopGroup == nil
-        self.inboxPrefix = "\(opts.inboxPrefix).\(Subject.randomToken())"
+        let inboxPrefix = "\(opts.inboxPrefix).\(Subject.randomToken())"
+        self.inboxPrefix = inboxPrefix
+        self.inboxReplyPrefix = inboxPrefix + "."
         self.reconnectionState = ReconnectionState(policy: opts.reconnect)
     }
 
@@ -153,7 +161,9 @@ public actor NatsClient {
         self.logger = options.logger
         self.eventLoopGroup = options.eventLoopGroup
         self.ownsEventLoopGroup = options.eventLoopGroup == nil
-        self.inboxPrefix = "\(options.inboxPrefix).\(Subject.randomToken())"
+        let inboxPrefix = "\(options.inboxPrefix).\(Subject.randomToken())"
+        self.inboxPrefix = inboxPrefix
+        self.inboxReplyPrefix = inboxPrefix + "."
         self.reconnectionState = ReconnectionState(policy: options.reconnect)
     }
 
@@ -219,6 +229,7 @@ public actor NatsClient {
     /// left parked by a previous one.
     private func beginHandshake() {
         handshakeInFlight = true
+        handshakeInfoReceived = false
         pendingHandshakeResult = nil
         connectContinuation = nil
         tlsHandshakeCompleted = false
@@ -337,6 +348,8 @@ public actor NatsClient {
         if let channel {
             try? await channel.close()
         }
+        outbound?.fail(ConnectionError.closed)
+        outbound = nil
         channel = nil
         connectionHandler = nil
     }
@@ -364,24 +377,34 @@ public actor NatsClient {
             }
         }
 
+        // Publishes return once queued; give the ones still queued a bounded
+        // chance to reach the socket before the connection goes.
+        if let outbound {
+            await outbound.flushQueued(within: Self.closeFlushWindow)
+        }
+
         _ = stateMachine.transition(on: .close)
 
         // Finish all subscriptions
-        await subscriptionManager.finishAll()
+        subscriptionManager.finishAll()
+        inboxSetup = nil
 
         // Bump the generation so a fresh connection on this client gets a
         // working subscription manager. `finishAll()` latches `isClosed`, which
         // silently discards every later message; without this reset the manager
         // stayed dead for the lifetime of the client.
-        await subscriptionManager.reopen()
+        subscriptionManager.reopen()
 
         // Cancel pending requests
-        for (_, continuation) in pendingRequests {
-            continuation.continuation.resume(throwing: ConnectionError.closed)
+        for (_, pending) in pendingRequests {
+            pending.timer.cancel()
+            pending.continuation.resume(throwing: ConnectionError.closed)
         }
         pendingRequests.removeAll()
 
         // Close channel
+        outbound?.fail(ConnectionError.closed)
+        outbound = nil
         if let channel = channel {
             try? await channel.close()
         }
@@ -428,7 +451,7 @@ public actor NatsClient {
         let deadline = ContinuousClock.now.advanced(by: options.drainTimeout)
 
         // Get all active subscriptions before we start draining
-        let activeSubscriptions = await subscriptionManager.getAllSubscriptions()
+        let activeSubscriptions = subscriptionManager.getAllSubscriptions()
 
         // Send UNSUB for all subscriptions to stop receiving new messages from server
         for (sid, _, _, _) in activeSubscriptions {
@@ -437,7 +460,7 @@ public actor NatsClient {
                 break
             }
             try? await write(.unsubscribe(sid: sid, max: nil))
-            await subscriptionManager.markDraining(sid: sid)
+            subscriptionManager.markDraining(sid: sid)
         }
 
         // Brief window for in-flight messages to arrive and be delivered, capped
@@ -451,7 +474,20 @@ public actor NatsClient {
 
     // MARK: - Publishing
 
-    /// Publish a message to a subject
+    /// Publish a message to a subject.
+    ///
+    /// Returns once the message is queued, in order, for this connection — not
+    /// once it reaches the socket. Frames are written and flushed in batches;
+    /// awaiting the socket for every message capped a publish loop at a few
+    /// thousand messages a second. A write that fails afterwards, or does not
+    /// reach the socket within `writeTimeout`, closes the connection, and the
+    /// next operation on that connection reports it. Messages still queued when
+    /// a connection is lost are dropped, not replayed after a reconnect: core
+    /// NATS publishing is at-most-once. Use JetStream publishes where delivery
+    /// has to be confirmed.
+    ///
+    /// Throws `backpressured` (through `serverError`) when the connection has not
+    /// drained within `writeBackpressureTimeout`; nothing was queued in that case.
     public func publish(
         _ subject: String,
         payload: ByteBuffer = ByteBuffer(),
@@ -471,7 +507,7 @@ public actor NatsClient {
         _messagesSent.wrappingAdd(1, ordering: .relaxed)
     }
 
-    /// Publish a message with a reply subject
+    /// Publish a message with a reply subject. Queued like `publish(_:payload:headers:)`.
     public func publish(
         _ subject: String,
         payload: ByteBuffer,
@@ -495,7 +531,11 @@ public actor NatsClient {
 
     // MARK: - Request-Reply
 
-    /// Send a request and wait for a response
+    /// Send a request and wait for a response.
+    ///
+    /// Bounded by `timeout` (default `requestTimeout`) and cancellable: a
+    /// cancelled caller gets `CancellationError` and its reply, if one still
+    /// arrives, is dropped.
     public func request(
         _ subject: String,
         payload: ByteBuffer = ByteBuffer(),
@@ -503,6 +543,7 @@ public actor NatsClient {
         timeout: Duration? = nil
     ) async throws -> NatsMessage {
         try Subject.validateForPublish(subject)
+        try Task.checkCancellation()
 
         guard stateMachine.state.canAcceptOperations else {
             throw ConnectionError.closed
@@ -511,32 +552,49 @@ public actor NatsClient {
         // Ensure inbox subscription is set up
         try await ensureInboxSubscription()
 
+        guard let outbound else {
+            throw ConnectionError.closed
+        }
+        if outbound.isSaturated {
+            try await awaitCapacity(outbound)
+        }
+
         let replySubject = Subject.newInbox(prefix: inboxPrefix)
         let effectiveTimeout = timeout ?? options.requestTimeout
+        let frame = ClientOp.publish(subject: subject, reply: replySubject, headers: headers, payload: payload)
 
-        return try await withCheckedThrowingContinuation { continuation in
-            Task {
-                // Store continuation with original request subject for error reporting
-                await self.storePendingRequest(replySubject: replySubject, requestSubject: subject, continuation: continuation)
-
-                // Publish request
-                do {
-                    try await self.write(.publish(subject: subject, reply: replySubject, headers: headers, payload: payload))
-                    self._messagesSent.wrappingAdd(1, ordering: .relaxed)
-                } catch {
-                    await self.removePendingRequest(replySubject: replySubject)
-                    continuation.resume(throwing: error)
-                    return
-                }
-
-                // Set up timeout
-                Task {
-                    try? await Task.sleep(for: effectiveTimeout)
-                    if let pending = await self.removePendingRequest(replySubject: replySubject) {
-                        pending.continuation.resume(throwing: NatsError.timeout(operation: "request", after: effectiveTimeout))
+        // Registering the pending request and queuing its frame happen in one
+        // actor step, so no reply can be processed in between. No task is
+        // spawned per request beyond the timer.
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<NatsMessage, any Error>) in
+                // Detached so that cancelling it on the reply does not wake a
+                // task on this actor just to return.
+                let timer = Task.detached { [weak self] in
+                    do {
+                        try await Task.sleep(for: effectiveTimeout)
+                    } catch {
+                        return  // reply arrived, or the request was cancelled
                     }
+                    await self?.expirePendingRequest(replySubject: replySubject, after: effectiveTimeout)
+                }
+                pendingRequests[replySubject] = PendingRequest(
+                    continuation: continuation,
+                    requestSubject: subject,
+                    timer: timer
+                )
+
+                do {
+                    try outbound.enqueue(frame)
+                    _messagesSent.wrappingAdd(1, ordering: .relaxed)
+                } catch {
+                    pendingRequests.removeValue(forKey: replySubject)
+                    timer.cancel()
+                    continuation.resume(throwing: error)
                 }
             }
+        } onCancel: {
+            Task { await self.cancelPendingRequest(replySubject: replySubject) }
         }
     }
 
@@ -559,24 +617,8 @@ public actor NatsClient {
             throw .serverError("Not connected")
         }
 
-        let sid = await subscriptionManager.generateSid()
-
         let (stream, continuation) = AsyncStream<NatsMessage>.makeStream()
-
-        await subscriptionManager.register(
-            sid: sid,
-            subject: subject,
-            queueGroup: queue,
-            continuation: continuation
-        )
-
-        // Send SUB to server
-        do {
-            try await write(.subscribe(sid: sid, subject: subject, queue: queue))
-        } catch {
-            await subscriptionManager.unregister(sid: sid)
-            throw .serverError("Subscribe failed: \(error)")
-        }
+        let sid = try await subscribe(subject, queue: queue, sink: .stream(continuation))
 
         return Subscription(
             subject: subject,
@@ -592,15 +634,40 @@ public actor NatsClient {
         )
     }
 
-    private func unsubscribe(sid: String) async {
+    /// Subscribe with an internal sink and return the subscription id.
+    ///
+    /// For the client's own inboxes. Pair with `unsubscribe(sid:)`.
+    func subscribe(
+        _ subject: String,
+        queue: String? = nil,
+        sink: SubscriptionSink
+    ) async throws(ProtocolError) -> String {
+        guard stateMachine.state.canAcceptOperations else {
+            throw .serverError("Not connected")
+        }
+
+        let sid = subscriptionManager.generateSid()
+        subscriptionManager.register(sid: sid, subject: subject, queueGroup: queue, sink: sink)
+
+        // Send SUB to server
+        do {
+            try await write(.subscribe(sid: sid, subject: subject, queue: queue))
+        } catch {
+            subscriptionManager.unregister(sid: sid)
+            throw .serverError("Subscribe failed: \(error)")
+        }
+        return sid
+    }
+
+    func unsubscribe(sid: String) async {
         // First send UNSUB to server to stop message delivery
         try? await write(.unsubscribe(sid: sid, max: nil))
         // Then unregister locally (subscription enters draining state for in-flight messages)
-        await subscriptionManager.unregister(sid: sid)
+        subscriptionManager.unregister(sid: sid)
     }
 
     private func autoUnsubscribe(sid: String, max: Int) async {
-        await subscriptionManager.setAutoUnsubscribe(sid: sid, max: max)
+        subscriptionManager.setAutoUnsubscribe(sid: sid, max: max)
         try? await write(.unsubscribe(sid: sid, max: max))
     }
 
@@ -619,6 +686,17 @@ public actor NatsClient {
     /// Server information (if connected)
     public var serverInfo: ServerInfo? {
         stateMachine.state.serverInfo
+    }
+
+    /// Active subscriptions, including the client's own inboxes. Test-only.
+    internal var subscriptionCountForTesting: Int {
+        subscriptionManager.count
+    }
+
+    /// The configured inbox root (`NatsClientOptions.inboxPrefix`), for
+    /// inboxes other than the request inbox.
+    nonisolated var configuredInboxPrefix: String {
+        options.inboxPrefix
     }
 
     /// Client statistics
@@ -646,6 +724,8 @@ public actor NatsClient {
 
         // Close the previous connection's channel so a dropped or
         // failed-handshake socket isn't left dangling on the event loop.
+        outbound?.fail(ConnectionError.closed)
+        outbound = nil
         if let oldChannel = channel {
             try? await oldChannel.close()
             self.channel = nil
@@ -676,20 +756,39 @@ public actor NatsClient {
         // tls:// scheme or explicit tls.enabled means we want TLS
         self.usingTLS = false  // Will be set to true after TLS upgrade
 
+        // Everything the connection reports reaches the actor through one
+        // ordered stream, drained by one task: server ops in wire order, then
+        // the close. A task per inbound op (what this replaces) cost a task and
+        // an actor hop per message and gave no ordering guarantee — a pull's
+        // terminal status could be handled before the messages sent ahead of it.
+        let (inbound, inboundContinuation) = AsyncStream<InboundEvent>.makeStream()
         let handler = ConnectionHandler(
             logger: logger,
             maxPingsOut: options.maxPingsOut,
-            onMessage: { [weak self] op in
-                Task { await self?.handleServerOp(op, generation: generation) }
+            onMessages: { ops in
+                inboundContinuation.yield(.ops(ops))
             },
             onOpen: { [weak self] in
                 Task { await self?.handleConnectionOpen(generation: generation) }
             },
-            onClose: { [weak self] error in
-                Task { await self?.handleConnectionClose(error: error, generation: generation) }
+            onClose: { error in
+                inboundContinuation.yield(.closed(error))
+                inboundContinuation.finish()
             }
         )
         self.connectionHandler = handler
+
+        Task { [weak self] in
+            for await event in inbound {
+                guard let self else { return }
+                switch event {
+                case .ops(let ops):
+                    await self.handleServerOps(ops, generation: generation)
+                case .closed(let error):
+                    await self.handleConnectionClose(error: error, generation: generation)
+                }
+            }
+        }
 
         // NATS uses TLS upgrade protocol - connect via TCP first, then upgrade after INFO
         let protocolLogger = self.logger
@@ -714,15 +813,30 @@ public actor NatsClient {
 
         do {
             let channel = try await bootstrap.connect(host: host, port: port).get()
+            let abandonLogger = logger
+            self.outbound = OutboundQueue(
+                channel: channel,
+                writeTimeout: options.writeTimeout,
+                maxQueuedBytes: max(options.writeBufferWaterMark.high * 16, 1024 * 1024),
+                onAbandon: { channel, _ in
+                    abandonLogger.error("Abandoned an in-flight write; closing the connection because a partly flushed frame leaves the stream unusable")
+                    channel.close(promise: nil)
+                }
+            )
             self.channel = channel
             logger.info("TCP connection established to \(host):\(port)")
-            await drainPendingServerOps()
+            drainPendingServerOps()
         } catch {
+            // A channel that never became active gets no channelInactive, so
+            // nothing would ever end the inbound stream or the task draining
+            // it — one leaked task per failed attempt, without bound under an
+            // unlimited reconnect policy.
+            inboundContinuation.finish()
             throw ConnectionError.connectionRefused(host: host, port: port)
         }
     }
 
-    private func handleServerOp(_ op: ServerOp, generation: UInt64) async {
+    private func handleServerOps(_ ops: [ServerOp], generation: UInt64) {
         // Drop frames from a superseded connection (e.g. a late INFO from a
         // channel being torn down during reconnect).
         guard generation == connectionGeneration else { return }
@@ -736,33 +850,51 @@ public actor NatsClient {
         // race misreported as the server hanging up. Park the frame; assigning
         // the channel drains this queue in order.
         if channel == nil && handshakeInFlight {
-            pendingServerOps.append(op)
+            pendingServerOps.append(contentsOf: ops)
             return
         }
 
-        await process(op)
+        for op in ops {
+            process(op)
+        }
     }
 
     /// Deliver frames that arrived before the channel was registered.
-    private func drainPendingServerOps() async {
+    private func drainPendingServerOps() {
         guard !pendingServerOps.isEmpty else { return }
         let queued = pendingServerOps
         pendingServerOps.removeAll()
         for op in queued {
-            await process(op)
+            process(op)
         }
     }
 
-    private func process(_ op: ServerOp) async {
+    private func process(_ op: ServerOp) {
         switch op {
         case .info(let serverInfo):
-            await handleInfo(serverInfo)
+            if handshakeInFlight && !handshakeInfoReceived {
+                handshakeInfoReceived = true
+                // The handshake suspends (TLS upgrade, CONNECT, the -ERR
+                // window), and the ops after INFO — an -ERR above all — must
+                // keep flowing while it does, so it runs beside the inbound
+                // stream rather than in it.
+                Task { await self.handleInfo(serverInfo) }
+            } else {
+                // Everything else is an async update, whatever the state. The
+                // server can send one in answer to a client's first PING, and
+                // `close()` sends a PING to flush: gating on `.connected`
+                // alone read that INFO, arriving mid-close, as a new handshake
+                // and tried to send CONNECT on a closing connection. A second
+                // INFO inside the handshake's own -ERR window would likewise
+                // have sent CONNECT twice.
+                handleAsyncServerInfoUpdate(serverInfo)
+            }
 
         case .msg(let subject, let sid, let reply, let payload):
-            await handleMessage(subject: subject, sid: sid, reply: reply, headers: nil, payload: payload)
+            handleMessage(subject: subject, sid: sid, reply: reply, headers: nil, payload: payload)
 
         case .hmsg(let subject, let sid, let reply, let headers, let payload):
-            await handleMessage(subject: subject, sid: sid, reply: reply, headers: headers, payload: payload)
+            handleMessage(subject: subject, sid: sid, reply: reply, headers: headers, payload: payload)
 
         case .ping:
             // Handled by ConnectionHandler
@@ -844,7 +976,13 @@ public actor NatsClient {
             // This allows us to catch -ERR responses (auth failures) before confirming
             awaitingConnectionConfirmation = true
 
-            try await write(.connect(connectInfo))
+            // Awaited to the socket, unlike other frames: over TLS this write
+            // completes only once the handshake has, which is what lets a
+            // stalled handshake be reported as one.
+            guard let outbound else {
+                throw ConnectionError.closed
+            }
+            try await outbound.enqueueAndWait(.connect(connectInfo))
 
             // Small delay to allow -ERR to arrive before confirming connection
             // This catches auth failures that arrive shortly after CONNECT
@@ -936,7 +1074,7 @@ public actor NatsClient {
         reply: String?,
         headers: NatsHeaders?,
         payload: ByteBuffer
-    ) async {
+    ) {
         _messagesReceived.wrappingAdd(1, ordering: .relaxed)
 
         let message = NatsMessage(
@@ -948,7 +1086,8 @@ public actor NatsClient {
         )
 
         // Check if this is a response to a pending request
-        if subject.hasPrefix(inboxPrefix + "."), let pending = pendingRequests.removeValue(forKey: subject) {
+        if subject.hasPrefix(inboxReplyPrefix), let pending = pendingRequests.removeValue(forKey: subject) {
+            pending.timer.cancel()
             // Check for no responders - use the original request subject for clearer error messages
             if let headers = headers, headers.isNoResponders {
                 pending.continuation.resume(throwing: ProtocolError.noResponders(subject: pending.requestSubject))
@@ -959,7 +1098,7 @@ public actor NatsClient {
         }
 
         // Deliver to subscription
-        let delivered = await subscriptionManager.deliver(sid: sid, message: message)
+        let delivered = subscriptionManager.deliver(sid: sid, message: message)
         if !delivered {
             logger.warning("Received message for unknown subscription: \(sid)")
         }
@@ -980,6 +1119,10 @@ public actor NatsClient {
         }
 
         logger.info("Connection closed: \(error?.localizedDescription ?? "no error")")
+
+        // Frames still queued for this connection will not be written. A
+        // failure already recorded (a missed write deadline) is kept.
+        outbound?.fail(error ?? ConnectionError.closed)
 
         // If we're still waiting on connect, fail the handshake. The
         // in-flight guard inside settleHandshake keeps a close that arrives
@@ -1009,11 +1152,13 @@ public actor NatsClient {
             // restores these same subscriptions and finishing them would destroy
             // the thing being restored.
             logger.info("Connection lost and reconnection is disabled; finishing all subscriptions")
-            await subscriptionManager.finishAll()
+            subscriptionManager.finishAll()
+            // The request inbox went with them; a later connect subscribes again.
+            inboxSetup = nil
 
             // Clear the closed latch so a caller who reconnects by hand gets a
             // working manager rather than one that silently discards everything.
-            await subscriptionManager.reopen()
+            subscriptionManager.reopen()
         }
     }
 
@@ -1093,7 +1238,7 @@ public actor NatsClient {
     /// otherwise make subscriptions silently stop receiving messages after a
     /// reconnect.
     private func resubscribeAll() async {
-        let subs = await subscriptionManager.getAllSubscriptions()
+        let subs = subscriptionManager.getAllSubscriptions()
         logger.debug("Resubscribing to \(subs.count) subject(s) after reconnect")
         for (sid, subject, queue, remainingMax) in subs {
             do {
@@ -1168,112 +1313,31 @@ public actor NatsClient {
     }
 
     private func ensureInboxSubscription() async throws {
-        if inboxSubscription != nil { return }
-
-        let inboxSubject = "\(inboxPrefix).>"
-        inboxSubscription = try await subscribe(inboxSubject)
-
-        Task {
-            guard let sub = inboxSubscription else { return }
-            for await message in sub {
-                // Messages are handled in handleMessage via the subscription manager
-                _ = message
-            }
-        }
-    }
-
-    private func storePendingRequest(
-        replySubject: String,
-        requestSubject: String,
-        continuation: CheckedContinuation<NatsMessage, any Error>
-    ) async {
-        pendingRequests[replySubject] = PendingRequest(
-            continuation: continuation,
-            requestSubject: requestSubject
-        )
-    }
-
-    @discardableResult
-    private func removePendingRequest(
-        replySubject: String
-    ) async -> PendingRequest? {
-        pendingRequests.removeValue(forKey: replySubject)
-    }
-
-    private func write(_ op: ClientOp) async throws {
-        guard let channel = channel else {
-            throw ConnectionError.closed
+        if let inboxSetup {
+            try await inboxSetup.value
+            return
         }
 
-        // Refuse before queuing when the connection is saturated.
-        //
-        // This is the recoverable half of bounding writes. Once bytes are handed
-        // to `writeAndFlush` they cannot be un-queued — abandoning a partially
-        // flushed frame would corrupt the stream for every later operation — so
-        // the only safe place to say no is *before* the write. A peer that stops
-        // reading previously turned into unbounded buffering here.
-        if !channel.isWritable {
-            let waited = try await awaitWritable(channel)
-            if !waited {
-                throw ConnectionError.backpressured(after: options.writeBackpressureTimeout)
-            }
-        }
-
-        try await flush(op, on: channel)
-    }
-
-    /// Write one frame with a deadline, honouring cancellation.
-    ///
-    /// `channel.writeAndFlush(op)` alone is unbounded *and* non-cancellable:
-    /// NIO's async bridge awaits the promise, which completes only when the
-    /// bytes reach the socket. Against a peer that accepts and stops reading,
-    /// that promise is never fulfilled — measured: 512 KiB absorbed by the
-    /// kernel, then the next frame parks forever and resolves only when the
-    /// channel is destroyed.
-    ///
-    /// The deadline is enforced by the event loop, because a Swift-side race
-    /// would return while the write stayed pending. Whoever settles first —
-    /// completion, deadline, or cancellation — owns the outcome.
-    ///
-    /// **Abandoning a write closes the connection.** Bytes already handed to
-    /// the channel cannot be recalled, so a frame abandoned midway leaves the
-    /// stream desynchronised; every later operation would land at a boundary
-    /// the server no longer agrees with. Tearing down is the price of bounding
-    /// a write at all, and it has a useful side effect: closing fails the
-    /// orphaned promise, so the abandoned write does not leak.
-    private func flush(_ op: ClientOp, on channel: Channel) async throws {
-        let timeout = options.writeTimeout
-        let eventLoop = channel.eventLoop
-        let outcome = eventLoop.makePromise(of: Void.self)
-        let settled = WriteSettleFlag()
-
-        let deadline = eventLoop.scheduleTask(in: TimeAmount(timeout)) {
-            guard settled.claim() else { return }
-            outcome.fail(ConnectionError.writeTimedOut(after: timeout))
-        }
-
-        channel.writeAndFlush(op).whenComplete { result in
-            guard settled.claim() else { return }
-            deadline.cancel()
-            outcome.completeWith(result)
-        }
-
+        let setup = Task { try await self.subscribeRequestInbox() }
+        inboxSetup = setup
         do {
-            try await withTaskCancellationHandler {
-                try await outcome.futureResult.get()
-            } onCancel: {
-                eventLoop.execute {
-                    guard settled.claim() else { return }
-                    deadline.cancel()
-                    outcome.fail(CancellationError())
-                }
-            }
+            try await setup.value
         } catch {
-            if Self.abandonsFrame(error) {
-                await tearDownAbandonedWrite(channel)
+            if inboxSetup == setup {
+                inboxSetup = nil
             }
             throw error
         }
+    }
+
+    /// Subscribe the shared request inbox. Replies are taken from
+    /// `pendingRequests` before subscription delivery, so the sink only sees
+    /// replies that arrived after their request gave up, and drops them.
+    private func subscribeRequestInbox() async throws {
+        _ = try await subscribe(
+            "\(inboxPrefix).>",
+            sink: .handler(onMessage: { _ in }, onFinish: {})
+        )
     }
 
     /// Record that the current attempt's TLS handshake finished.
@@ -1298,31 +1362,38 @@ public actor NatsClient {
         return .timeout(after: timeout)
     }
 
-    /// Whether this failure means a frame was abandoned mid-flight, as opposed
-    /// to never having been handed over or having failed outright.
-    private static func abandonsFrame(_ error: any Error) -> Bool {
-        if error is CancellationError { return true }
-        if let connectionError = error as? ConnectionError,
-           case .writeTimedOut = connectionError {
-            return true
-        }
-        return false
+
+    private func expirePendingRequest(replySubject: String, after timeout: Duration) {
+        guard let pending = pendingRequests.removeValue(forKey: replySubject) else { return }
+        pending.continuation.resume(throwing: NatsError.timeout(operation: "request", after: timeout))
     }
 
-    /// Close the connection a frame was abandoned on.
+    private func cancelPendingRequest(replySubject: String) {
+        guard let pending = pendingRequests.removeValue(forKey: replySubject) else { return }
+        pending.timer.cancel()
+        pending.continuation.resume(throwing: CancellationError())
+    }
+
+    /// Queue `op` for the current connection, waiting first if it is saturated.
     ///
-    /// Deliberately closes the *channel* rather than calling `close()`: the
-    /// latter parks the state machine in the terminal `.closed` state and would
-    /// make the client permanently unusable. Closing the channel routes through
-    /// `handleConnectionClose`, which returns the state to `.disconnected` and
-    /// starts reconnection when it is enabled.
-    private func tearDownAbandonedWrite(_ channel: Channel) async {
-        guard self.channel === channel else {
-            return  // already replaced by a newer attempt; nothing to tear down
+    /// Returns once the frame is queued, not once it is on the socket — see
+    /// `OutboundQueue` for what that guarantees and how a later write failure
+    /// is reported.
+    private func write(_ op: ClientOp) async throws {
+        guard let outbound else {
+            throw ConnectionError.closed
         }
 
-        logger.error("Abandoned an in-flight write; closing the connection because a partly flushed frame leaves the stream unusable")
-        try? await channel.close()
+        // Refuse before queuing when the connection is saturated.
+        //
+        // This is the recoverable half of bounding writes: nothing has been
+        // queued, so the caller can retry. A peer that stops reading previously
+        // turned into unbounded buffering here.
+        if outbound.isSaturated {
+            try await awaitCapacity(outbound)
+        }
+
+        try outbound.enqueue(op)
     }
 
     /// Wait for a saturated connection to drain, up to `writeBackpressureTimeout`.
@@ -1333,8 +1404,10 @@ public actor NatsClient {
     /// avoids a second continuation handoff — the exact machinery that produced
     /// the lost-wakeup and double-resume bugs on the handshake path.
     ///
-    /// Returns false if the connection never became writable in time.
-    private func awaitWritable(_ channel: Channel) async throws -> Bool {
+    /// Throws `backpressured` if the connection never drained in time, and the
+    /// queue's own failure — typically `writeTimedOut` — if the connection was
+    /// abandoned while waiting.
+    private func awaitCapacity(_ outbound: OutboundQueue) async throws {
         let deadline = ContinuousClock.now.advanced(by: options.writeBackpressureTimeout)
         logger.debug("Connection is saturated; waiting for it to drain before writing")
 
@@ -1342,17 +1415,33 @@ public actor NatsClient {
             try Task.checkCancellation()
 
             // A connection that dies while we wait must fail the write rather
-            // than spin out the full timeout.
-            guard self.channel === channel else {
-                throw ConnectionError.closed
+            // than spin out the full timeout, and say why it died.
+            if let failure = outbound.failure {
+                throw failure
             }
-            if channel.isWritable {
-                return true
+            guard self.outbound === outbound, outbound.channel.isActive else {
+                throw outbound.failure ?? ConnectionError.closed
+            }
+            if !outbound.isSaturated {
+                return
             }
             try await Task.sleep(for: Self.writabilityPollInterval)
         }
-        return channel.isWritable
+
+        if let failure = outbound.failure {
+            throw failure
+        }
+        if !outbound.isSaturated {
+            return
+        }
+        throw ConnectionError.backpressured(after: options.writeBackpressureTimeout)
     }
+}
+
+/// What a connection reports to the client, in order.
+private enum InboundEvent: Sendable {
+    case ops([ServerOp])
+    case closed((any Error)?)
 }
 
 // MARK: - Client Statistics

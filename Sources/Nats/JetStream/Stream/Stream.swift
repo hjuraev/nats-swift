@@ -44,9 +44,10 @@ public actor Stream {
         try await purge(request: PurgeRequest(filter: subject))
     }
 
-    /// Purge messages up to a sequence number
+    /// Purge messages with a sequence below `seq`.
     public func purge(upToSequence seq: UInt64) async throws(JetStreamError) -> PurgeResponse {
-        try await purge(request: PurgeRequest(seq: seq))
+        guard seq > 1 else { return Self.nothingPurged }
+        return try await purge(request: PurgeRequest(seq: seq))
     }
 
     /// Purge messages matching a subject filter, optionally keeping some
@@ -54,11 +55,40 @@ public actor Stream {
         try await purge(request: PurgeRequest(filter: subject, keep: keep))
     }
 
-    /// Purge messages older than a given time
+    /// Purge messages on `subject` with a sequence below `seq`, keeping `seq`
+    /// and everything after it.
+    ///
+    /// The sequence bound is what makes a subject purge safe against a
+    /// concurrent write: a message stored after the caller chose `seq` has a
+    /// higher sequence and survives, where `purge(subject:)` would remove it.
+    public func purge(subject: String, upToSequence seq: UInt64) async throws(JetStreamError) -> PurgeResponse {
+        guard seq > 1 else { return Self.nothingPurged }
+        return try await purge(request: PurgeRequest(filter: subject, seq: seq))
+    }
+
+    /// Nothing lies below sequence 1, so a bound of 0 or 1 purges nothing —
+    /// and must not reach the server: file storage reads `seq: 1` as no bound
+    /// at all and purges everything (on `filter`, everything on that subject),
+    /// while memory storage purges nothing. Measured on nats-server 2.12.
+    private static let nothingPurged = PurgeResponse(success: true, purged: 0)
+
+    /// Purge messages stored more than `threshold` ago, keeping newer ones.
+    ///
+    /// The purge API has no time filter, so the cutoff is resolved to the
+    /// sequence of the first message stored at or after it, and everything
+    /// below that sequence is purged. Messages published while this runs have
+    /// higher sequences and are kept.
+    ///
+    /// The cutoff is `now - threshold` on this client's clock: a clock running
+    /// ahead of the server's purges messages newer than intended, so keep
+    /// `threshold` well above any skew.
+    ///
+    /// This used to send `keep: 0` with no filter, which the server reads as
+    /// "purge everything": every call emptied the stream regardless of age.
     public func purge(olderThan threshold: Duration) async throws(JetStreamError) -> PurgeResponse {
-        // Calculate cutoff time
-        // Note: Duration doesn't directly convert to Date, this is simplified
-        try await purge(request: PurgeRequest(keep: 0))
+        let cutoff = Date().addingTimeInterval(-threshold.timeInterval)
+        let firstKept = try await context.sequence(stream: name, atOrAfter: cutoff)
+        return try await purge(upToSequence: firstKept)
     }
 
     private func purge(request: PurgeRequest) async throws(JetStreamError) -> PurgeResponse {
@@ -69,7 +99,8 @@ public actor Stream {
         } catch {
             throw JetStreamError.invalidStreamConfig(error.localizedDescription)
         }
-        let response = try await context.request("$JS.API.STREAM.PURGE.\(name)", payload: payload)
+        let prefix = await context.apiPrefix
+        let response = try await context.request("\(prefix).STREAM.PURGE.\(name)", payload: payload)
         do {
             return try JSONDecoder().decode(PurgeResponse.self, from: response.data)
         } catch {

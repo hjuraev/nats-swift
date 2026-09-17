@@ -20,7 +20,7 @@ final class ConnectionHandler: ChannelInboundHandler, @unchecked Sendable {
     }
 
     private let logger: Logger
-    private let onMessage: @Sendable (ServerOp) -> Void
+    private let onMessages: @Sendable ([ServerOp]) -> Void
     private let onClose: @Sendable (Error?) -> Void
     private let onOpen: @Sendable () -> Void
 
@@ -30,16 +30,25 @@ final class ConnectionHandler: ChannelInboundHandler, @unchecked Sendable {
     private var pingTask: RepeatedTask?
     private var channelContext: ChannelHandlerContext?
 
+    /// Ops decoded during the current read, handed over together on
+    /// `channelReadComplete`. Event-loop confined.
+    private var inbound: [ServerOp] = []
+
+    /// - Parameter onMessages: receives every decoded server op, in wire order,
+    ///   one batch per socket read. Batching is what lets the client process a
+    ///   burst of messages in one step instead of scheduling a task per message,
+    ///   and delivering batches in order is what keeps a pull's terminal status
+    ///   behind the messages that preceded it.
     init(
         logger: Logger,
         maxPingsOut: Int = 2,
-        onMessage: @escaping @Sendable (ServerOp) -> Void,
+        onMessages: @escaping @Sendable ([ServerOp]) -> Void,
         onOpen: @escaping @Sendable () -> Void,
         onClose: @escaping @Sendable (Error?) -> Void
     ) {
         self.logger = logger
         self.maxPingsOut = maxPingsOut
-        self.onMessage = onMessage
+        self.onMessages = onMessages
         self.onOpen = onOpen
         self.onClose = onClose
     }
@@ -55,6 +64,8 @@ final class ConnectionHandler: ChannelInboundHandler, @unchecked Sendable {
     func channelInactive(context: ChannelHandlerContext) {
         logger.trace("Channel inactive")
         cancelPingTask()
+        // Anything read but not yet handed over goes before the close event.
+        forwardInbound()
         onClose(nil)
     }
 
@@ -77,8 +88,20 @@ final class ConnectionHandler: ChannelInboundHandler, @unchecked Sendable {
             break
         }
 
-        // Forward all messages to handler
-        onMessage(op)
+        // Forward all messages to the client once the read completes.
+        inbound.append(op)
+    }
+
+    func channelReadComplete(context: ChannelHandlerContext) {
+        forwardInbound()
+        context.fireChannelReadComplete()
+    }
+
+    private func forwardInbound() {
+        guard !inbound.isEmpty else { return }
+        let batch = inbound
+        inbound.removeAll(keepingCapacity: true)
+        onMessages(batch)
     }
 
     func errorCaught(context: ChannelHandlerContext, error: Error) {

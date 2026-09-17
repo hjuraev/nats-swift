@@ -352,97 +352,79 @@ public actor JetStreamContext {
         }
     }
 
-    func getNextMessage(
-        stream: String,
-        consumer: String,
-        batch: Int,
-        expires: Duration?
-    ) async throws(JetStreamError) -> [JetStreamMessage] {
-        let effectiveExpires = expires ?? timeout
-        let expiresNanos = Int64(effectiveExpires.components.seconds * 1_000_000_000) +
-                          Int64(effectiveExpires.components.attoseconds / 1_000_000_000)
+    /// Subject a pull request for `consumer` is published to.
+    nonisolated func consumerNextSubject(stream: String, consumer: String) -> String {
+        API.consumerNext(prefix, stream, consumer)
+    }
 
-        let request = NextMessageRequest(
-            batch: batch,
-            expires: expiresNanos
-        )
+    /// Default deadline for API requests, and for a fetch without `maxWait`.
+    nonisolated var requestTimeout: Duration { timeout }
 
-        let payload = try encode(request)
-        let subject = API.consumerNext(prefix, stream, consumer)
-
-        // Create a unique inbox for receiving messages
-        let inbox = Subject.newInbox()
+    /// The sequence of the first message stored at or after `date`, or the
+    /// stream's last sequence + 1 when every message is older.
+    ///
+    /// Asks MSG.GET with `start_time` (nats-server 2.11+). A server that does
+    /// not know the field rejects the request, and the answer then comes from a
+    /// consumer created with `by_start_time`, whose delivered stream sequence
+    /// starts one below the first match; it is deleted straight away and never
+    /// pulls. That fallback cannot be created on a work-queue stream that
+    /// already has an unfiltered consumer, and throws there.
+    func sequence(stream: String, atOrAfter date: Date) async throws(JetStreamError) -> UInt64 {
+        // Read before the lookup: anything stored after this is newer than the
+        // cutoff, so "every message is older" can safely mean "below here".
+        let streamInfo = try decode(try await request(API.streamInfo(prefix, stream), payload: ByteBuffer()), as: StreamInfo.self)
 
         do {
-            // Subscribe to the inbox to receive messages
-            let subscription = try await client.subscribe(inbox)
-
-            // Send the pull request with our inbox as reply-to
-            try await client.publish(subject, payload: payload, reply: inbox)
-
-            var messages: [JetStreamMessage] = []
-            let deadline = ContinuousClock.now + effectiveExpires
-
-            // Enforce the deadline on the *iteration*, not just between messages.
-            //
-            // The in-loop check below only runs once a message has arrived, so a
-            // consumer that stays silent — a pull request lost in a reconnect
-            // window, for instance — left this `for await` suspended forever and
-            // `expires` did nothing. Unsubscribing finishes the stream, which
-            // ends the loop; it is the same teardown the happy path performs, so
-            // there is no second mechanism to keep correct.
-            let expiry = Task {
-                try? await Task.sleep(for: effectiveExpires)
-                await subscription.unsubscribe()
-            }
-            defer { expiry.cancel() }
-
-            // Collect messages until batch is filled, timeout, or terminal status
-            for await msg in subscription {
-                // Check for status headers (404 No Messages, 408 Timeout, 409 Exceeded MaxRequestBatch)
-                if let headers = msg.headers {
-                    if headers.isNoMessages || headers.isTimeout {
-                        // No more messages available
-                        break
-                    }
-                    if let status = headers.status, status >= 400 {
-                        // Some other error status
-                        break
-                    }
-                }
-
-                // Parse as JetStream message
-                do {
-                    let jsMessage = try JetStreamMessage.parse(msg, context: self, stream: stream, consumer: consumer)
-                    messages.append(jsMessage)
-                } catch {
-                    // Skip messages that can't be parsed (might be status messages)
-                    continue
-                }
-
-                // Check if we've collected enough messages
-                if messages.count >= batch {
-                    break
-                }
-
-                // Check timeout
-                if ContinuousClock.now >= deadline {
-                    break
-                }
-            }
-
-            await subscription.unsubscribe()
-            return messages
+            let response = try await request(
+                API.streamMsg(prefix, stream),
+                payload: encode(StartTimeMessageRequest(startTime: date))
+            )
+            return try decode(response, as: StartTimeMessageResponse.self).message.seq
         } catch {
-            throw JetStreamError.pullFailed(error.localizedDescription)
+            if case .apiError(let code, let errorCode, _) = error, code == 404 || errorCode == 10037 {
+                return streamInfo.state.lastSeq + 1
+            }
+            guard case .apiError = error else { throw error }
+            // Otherwise a server without `start_time`: resolve through a consumer.
         }
+
+        let consumer = try await createConsumer(
+            stream: stream,
+            config: ConsumerConfig(
+                deliverPolicy: .byStartTime,
+                optStartTime: date,
+                // Explicit so that work-queue streams accept it; it never pulls.
+                ackPolicy: .explicit,
+                inactiveThreshold: .seconds(30),
+                memStorage: true
+            )
+        )
+        let info = await consumer.info
+        try? await deleteConsumer(stream: stream, consumer: info.name)
+        return info.delivered.streamSeq + 1
     }
 
     // MARK: - Encoding/Decoding Helpers
 
-    func encode<T: Encodable>(_ value: T) throws(JetStreamError) -> ByteBuffer {
+    /// Encoder for JetStream API payloads.
+    ///
+    /// Dates go out as RFC 3339 with fractional seconds, the only form the
+    /// server accepts. Foundation's default encodes a `Date` as seconds since
+    /// 2001, which the server rejects — so every `optStartTime` was unusable.
+    static func makeEncoder() -> JSONEncoder {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .custom { date, encoder in
+            let formatter = ISO8601DateFormatter()
+            formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            var container = encoder.singleValueContainer()
+            try container.encode(formatter.string(from: date))
+        }
+        return encoder
+    }
+
+    nonisolated func encode<T: Encodable>(_ value: T) throws(JetStreamError) -> ByteBuffer {
         do {
-            let data = try JSONEncoder().encode(value)
+            let data = try Self.makeEncoder().encode(value)
             var buffer = ByteBuffer()
             buffer.writeBytes(data)
             return buffer
@@ -482,6 +464,22 @@ public actor JetStreamContext {
 
 // MARK: - Supporting Types
 
+/// MSG.GET by time. Only `seq` is read back.
+struct StartTimeMessageRequest: Encodable {
+    let startTime: Date
+
+    enum CodingKeys: String, CodingKey {
+        case startTime = "start_time"
+    }
+}
+
+struct StartTimeMessageResponse: Decodable {
+    struct Message: Decodable {
+        let seq: UInt64
+    }
+    let message: Message
+}
+
 struct JSErrorResponse: Codable {
     let error: JSError?
 
@@ -517,12 +515,14 @@ struct CreateConsumerRequest: Codable {
 
 struct NextMessageRequest: Codable {
     let batch: Int
+    let maxBytes: Int?
     let expires: Int64?
     let noWait: Bool?
     let idleHeartbeat: Int64?
 
-    init(batch: Int = 1, expires: Int64? = nil, noWait: Bool? = nil, idleHeartbeat: Int64? = nil) {
+    init(batch: Int = 1, maxBytes: Int? = nil, expires: Int64? = nil, noWait: Bool? = nil, idleHeartbeat: Int64? = nil) {
         self.batch = batch
+        self.maxBytes = maxBytes
         self.expires = expires
         self.noWait = noWait
         self.idleHeartbeat = idleHeartbeat
@@ -530,6 +530,7 @@ struct NextMessageRequest: Codable {
 
     enum CodingKeys: String, CodingKey {
         case batch
+        case maxBytes = "max_bytes"
         case expires
         case noWait = "no_wait"
         case idleHeartbeat = "idle_heartbeat"

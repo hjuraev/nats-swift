@@ -75,11 +75,11 @@ struct ClientLifecycleCorrectnessTests {
         let manager = SubscriptionManager()
 
         @Sendable func subscribeAndDeliver() async -> Bool {
-            let sid = await manager.generateSid()
+            let sid = manager.generateSid()
             let (stream, continuation) = AsyncStream<NatsMessage>.makeStream()
-            await manager.register(sid: sid, subject: "latch.test", queueGroup: nil, continuation: continuation)
+            manager.register(sid: sid, subject: "latch.test", queueGroup: nil, continuation: continuation)
 
-            _ = await manager.deliver(
+            _ = manager.deliver(
                 sid: sid,
                 message: NatsMessage(subject: "latch.test", buffer: ByteBuffer(string: "x"), sid: sid)
             )
@@ -95,12 +95,12 @@ struct ClientLifecycleCorrectnessTests {
 
         // finishAll() latches the manager shut: deliver() returns true but
         // discards, so the stream never yields and the wait times out.
-        await manager.finishAll()
+        manager.finishAll()
         let whileLatched = await boundedly(.seconds(1)) { await subscribeAndDeliver() }
         #expect(whileLatched == nil, "expected the latch to swallow the message, got \(String(describing: whileLatched))")
 
         // reopen() clears it.
-        await manager.reopen()
+        manager.reopen()
         let afterReopen = await boundedly(.seconds(2)) { await subscribeAndDeliver() }
         #expect(afterReopen == true, "manager still discarding after reopen()")
     }

@@ -77,6 +77,16 @@ public enum JetStreamError: NatsErrorProtocol {
     /// Pull request failed
     case pullFailed(String)
 
+    /// The next message is larger than the fetch's `maxBytes`, so no message
+    /// can be delivered until the limit is raised. Retrying with the same
+    /// limit returns the same error.
+    case messageExceedsMaxBytes(maxBytes: Int)
+
+    /// A bucket listing ended before every entry had been delivered — the
+    /// consumer still reports `pending` entries. Returning the partial list as
+    /// success made a short listing indistinguishable from a small bucket.
+    case incompleteListing(bucket: String, received: Int, pending: UInt64)
+
     /// Publish failed
     case publishFailed(String)
 
@@ -141,6 +151,10 @@ public enum JetStreamError: NatsErrorProtocol {
             return "Message acknowledgement failed: \(reason)"
         case .pullFailed(let reason):
             return "Pull request failed: \(reason)"
+        case .messageExceedsMaxBytes(let maxBytes):
+            return "Next message is larger than the fetch's maxBytes (\(maxBytes)); raise the limit to receive it"
+        case .incompleteListing(let bucket, let received, let pending):
+            return "Listing of bucket '\(bucket)' stopped after \(received) entries with \(pending) still pending"
         case .publishFailed(let reason):
             return "Publish failed: \(reason)"
         case .invalidBucketName(let name):

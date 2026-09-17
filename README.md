@@ -89,6 +89,13 @@ headers["Content-Type"] = "application/json"
 try await client.publish("events.order", payload: jsonData, headers: headers)
 ```
 
+`publish` returns once the message is queued for the connection, not once it is
+on the socket; frames are written and flushed in batches. A write that fails
+later, or misses `writeTimeout`, closes the connection and is reported by the
+next operation. When the connection stops draining, `publish` waits up to
+`writeBackpressureTimeout` and then throws without queuing. `close()` gives
+queued frames a bounded chance to reach the socket first.
+
 ### Subscribe to Messages
 
 ```swift
@@ -183,6 +190,9 @@ let consumer = try await js.createConsumer(
 // Fetch messages in batches
 let messages = try await consumer.fetch(batch: 10, maxWait: .seconds(5))
 
+// Or bound a batch by size rather than guessing a count
+let sized = try await consumer.fetch(batch: 10_000, maxBytes: 1_048_576, maxWait: .seconds(5))
+
 for message in messages {
     print("Processing: \(message.metadata.streamSequence)")
 
@@ -209,6 +219,45 @@ for await message in try await consumer.messages() {
         try await message.nak(delay: .seconds(5))
     }
 }
+```
+
+Each `Consumer` handle pulls into one inbox subscription reused by every fetch;
+messages that arrive after a fetch has returned are kept for the next one.
+`fetch` throws `messageExceedsMaxBytes` when the next message does not fit
+`maxBytes`, and `consumerNotFound` when the server reports the consumer deleted.
+
+## Key-Value
+
+```swift
+let kv = try await js.keyValue("config")
+
+// Every key at once, or a batch at a time for large buckets
+let keys = try await kv.keys()
+for try await batch in kv.keyBatches(batch: 2048) {
+    index(batch)
+}
+```
+
+Listings throw `incompleteListing` when they end with entries still pending,
+instead of returning a partial list.
+
+A watcher that lost its consumer can resume from its last revision instead of
+replaying the bucket — provided the revision is still stored and no delete
+marker after it has been purged (see `KeyValueWatchOptions.resumeFromRevision`):
+
+```swift
+let status = try await kv.status()
+if status.firstRevision <= lastRevision + 1 {
+    let watcher = try await kv.watchAll(options: .init(resumeFromRevision: lastRevision + 1))
+}
+```
+
+A caller that tracks delete markers from its own watch can remove them without
+listing the bucket. Each purge is bounded by the marker's revision, so a key
+written again after its marker keeps its new value:
+
+```swift
+try await kv.purgeDeletes(knownMarkers, olderThan: .seconds(3600), maxConcurrent: 16)
 ```
 
 ## TLS Configuration
@@ -426,6 +475,16 @@ try await client.drain()
 // Or immediate close
 await client.close()
 ```
+
+## Benchmarks
+
+```bash
+NATS_URL=nats://127.0.0.1:4222 swift run -c release NatsBenchmarks all
+```
+
+Publish, acked KV put, pull fetch and key listing throughput against a
+JetStream-enabled server. Measure on Linux: on macOS the Swift runtime can
+record a backtrace on every actor enqueue, which distorts the numbers.
 
 ## License
 

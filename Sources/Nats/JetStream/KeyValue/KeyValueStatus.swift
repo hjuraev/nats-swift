@@ -45,6 +45,13 @@ public struct KeyValueBucketStatus: Sendable {
     /// The full underlying stream info
     public let streamInfo: StreamInfo
 
+    /// The oldest revision still stored. A watcher resuming from a revision
+    /// below this has lost entries and must replay the bucket.
+    public var firstRevision: UInt64 { streamInfo.state.firstSeq }
+
+    /// The newest revision stored.
+    public var lastRevision: UInt64 { streamInfo.state.lastSeq }
+
     /// Construct from StreamInfo
     static func from(_ info: StreamInfo) -> KeyValueBucketStatus {
         let config = info.config
