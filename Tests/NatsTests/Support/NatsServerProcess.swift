@@ -10,24 +10,28 @@ final class NatsServerProcess {
     let port: Int
     private let binaryPath: String
     private let storeDirectory: String?
+    private var extraArguments: [String]
     private var process: Process?
 
-    private init(port: Int, binaryPath: String, storeDirectory: String?) {
+    private init(port: Int, binaryPath: String, storeDirectory: String?, extraArguments: [String]) {
         self.port = port
         self.binaryPath = binaryPath
         self.storeDirectory = storeDirectory
+        self.extraArguments = extraArguments
     }
 
     /// Locate the `nats-server` binary and start it. Returns `nil` when the
     /// binary is unavailable so the caller can skip the test.
     /// - Parameter jetStream: enable JetStream, backed by a per-server
     ///   temporary store so parallel or repeated runs cannot collide on state.
-    static func startIfAvailable(port: Int, jetStream: Bool = false) -> NatsServerProcess? {
+    /// - Parameter arguments: extra `nats-server` arguments, such as
+    ///   `["--user", "u", "--pass", "p"]`.
+    static func startIfAvailable(port: Int, jetStream: Bool = false, arguments: [String] = []) -> NatsServerProcess? {
         guard let binary = locateBinary() else { return nil }
         let store = jetStream
             ? NSTemporaryDirectory() + "nats-js-\(port)-\(UUID().uuidString.prefix(8))"
             : nil
-        let server = NatsServerProcess(port: port, binaryPath: binary, storeDirectory: store)
+        let server = NatsServerProcess(port: port, binaryPath: binary, storeDirectory: store, extraArguments: arguments)
         do {
             try server.launch()
             return server
@@ -38,6 +42,12 @@ final class NatsServerProcess {
 
     /// Start the server again after a `stop()` (same port).
     func restart() throws {
+        try launch()
+    }
+
+    /// Start the server again after a `stop()`, with different extra arguments.
+    func restart(arguments: [String]) throws {
+        extraArguments = arguments
         try launch()
     }
 
@@ -88,6 +98,7 @@ final class NatsServerProcess {
         if let storeDirectory {
             arguments += ["-js", "-sd", storeDirectory]
         }
+        arguments += extraArguments
         process.arguments = arguments
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
