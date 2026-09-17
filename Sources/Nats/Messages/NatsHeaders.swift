@@ -52,14 +52,45 @@ public struct NatsHeaders: Sendable, Equatable {
 
     // MARK: - Access
 
+    /// Case-insensitive header name comparison without allocating.
+    ///
+    /// Header names are ASCII on the wire, and every lookup used to lowercase
+    /// both names — two string allocations per comparison, on every message
+    /// whose status or KV operation was read. Falls back to `lowercased()`
+    /// only for non-ASCII names.
+    static func namesMatch(_ lhs: String, _ rhs: String) -> Bool {
+        var left = lhs.utf8.makeIterator()
+        var right = rhs.utf8.makeIterator()
+        while true {
+            switch (left.next(), right.next()) {
+            case (nil, nil):
+                return true
+            case (let l?, let r?):
+                if l == r { continue }
+                if l >= 0x80 || r >= 0x80 {
+                    return lhs.lowercased() == rhs.lowercased()
+                }
+                let foldedL = (l >= 0x41 && l <= 0x5A) ? l | 0x20 : l
+                let foldedR = (r >= 0x41 && r <= 0x5A) ? r | 0x20 : r
+                if foldedL != foldedR { return false }
+            default:
+                // Different lengths: unequal for ASCII, but lowercasing can
+                // change the length of other scripts.
+                return lhs.utf8.contains(where: { $0 >= 0x80 }) || rhs.utf8.contains(where: { $0 >= 0x80 })
+                    ? lhs.lowercased() == rhs.lowercased()
+                    : false
+            }
+        }
+    }
+
     /// Get the first value for a header key (case-insensitive)
     public subscript(_ key: String) -> String? {
         get {
-            storage.first { $0.0.lowercased() == key.lowercased() }?.1
+            storage.first { Self.namesMatch($0.0, key) }?.1
         }
         set {
             // Remove existing values for this key
-            storage.removeAll { $0.0.lowercased() == key.lowercased() }
+            storage.removeAll { Self.namesMatch($0.0, key) }
             // Add new value if provided
             if let value = newValue {
                 storage.append((key, value))
@@ -70,7 +101,7 @@ public struct NatsHeaders: Sendable, Equatable {
     /// Get all values for a header key (case-insensitive)
     public func values(for key: String) -> [String] {
         storage
-            .filter { $0.0.lowercased() == key.lowercased() }
+            .filter { Self.namesMatch($0.0, key) }
             .map(\.1)
     }
 
@@ -81,12 +112,12 @@ public struct NatsHeaders: Sendable, Equatable {
 
     /// Check if headers contain a key
     public func contains(_ key: String) -> Bool {
-        storage.contains { $0.0.lowercased() == key.lowercased() }
+        storage.contains { Self.namesMatch($0.0, key) }
     }
 
     /// Remove all values for a key
     public mutating func removeAll(for key: String) {
-        storage.removeAll { $0.0.lowercased() == key.lowercased() }
+        storage.removeAll { Self.namesMatch($0.0, key) }
     }
 
     /// Get all header keys (unique)

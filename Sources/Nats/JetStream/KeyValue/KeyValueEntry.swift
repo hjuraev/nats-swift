@@ -78,8 +78,13 @@ public struct KeyValueEntry: Sendable {
 
     /// Parse a KV entry from a consumer message
     static func fromConsumerMessage(_ message: JetStreamMessage, bucket: String) -> KeyValueEntry? {
+        fromConsumerMessage(message, bucket: bucket, keyPrefix: "$KV.\(bucket).")
+    }
+
+    /// Parse a KV entry from a consumer message, with the bucket's key prefix
+    /// (`$KV.<bucket>.`) built once by a caller parsing many messages.
+    static func fromConsumerMessage(_ message: JetStreamMessage, bucket: String, keyPrefix: String) -> KeyValueEntry? {
         let subject = message.subject
-        let keyPrefix = "$KV.\(bucket)."
         guard subject.hasPrefix(keyPrefix) else { return nil }
         let key = String(subject.dropFirst(keyPrefix.count))
 
@@ -167,20 +172,7 @@ public struct KeyValueEntry: Sendable {
     }
 
     private static func parseNatsTimestamp(_ str: String) -> Date {
-        // Try ISO8601 with fractional seconds
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = formatter.date(from: str) {
-            return date
-        }
-
-        // Try without fractional seconds
-        formatter.formatOptions = [.withInternetDateTime]
-        if let date = formatter.date(from: str) {
-            return date
-        }
-
-        return Date()
+        RFC3339.date(from: str) ?? Date()
     }
 }
 

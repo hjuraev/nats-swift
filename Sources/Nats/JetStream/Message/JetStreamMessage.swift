@@ -127,24 +127,21 @@ public struct JetStreamMessage: Sendable {
             throw JetStreamError.invalidAck("Missing reply subject")
         }
 
-        // Parse metadata from reply subject
         // Format: $JS.ACK.<stream>.<consumer>.<numDelivered>.<streamSeq>.<consumerSeq>.<timestamp>.<numPending>
-        let parts = replyTo.split(separator: ".")
-
-        guard parts.count >= 9,
-              parts[0] == "$JS",
-              parts[1] == "ACK" else {
+        guard let ack = AckSubject(replyTo) else {
             throw JetStreamError.invalidAck("Invalid reply subject format: \(replyTo)")
         }
 
         let metadata = MessageMetadata(
-            stream: String(parts[2]),
-            consumer: String(parts[3]),
-            numDelivered: UInt64(parts[4]) ?? 0,
-            streamSequence: UInt64(parts[5]) ?? 0,
-            consumerSequence: UInt64(parts[6]) ?? 0,
-            timestamp: parseTimestamp(String(parts[7])),
-            numPending: UInt64(parts[8]) ?? 0
+            // The fetching consumer's own names, when the subject carries them
+            // (it always does), rather than a fresh copy per message.
+            stream: ack.string(ack.stream, in: replyTo, reusing: stream),
+            consumer: ack.string(ack.consumer, in: replyTo, reusing: consumer),
+            numDelivered: ack.numDelivered,
+            streamSequence: ack.streamSequence,
+            consumerSequence: ack.consumerSequence,
+            timestamp: ack.timestampNanos.map { Date(timeIntervalSince1970: TimeInterval($0) / 1_000_000_000) } ?? Date(),
+            numPending: ack.numPending
         )
 
         return JetStreamMessage(
@@ -155,14 +152,79 @@ public struct JetStreamMessage: Sendable {
             consumer: consumer
         )
     }
+}
 
-    private static func parseTimestamp(_ str: String) -> Date {
-        // Timestamp is in nanoseconds since Unix epoch
-        guard let nanos = Int64(str) else {
-            return Date()
+/// The fields of a JetStream ack subject, read in one pass over its bytes.
+///
+/// Replaces `split(separator: ".")`, which built nine substrings for every
+/// message delivered to a consumer. Empty tokens are skipped and malformed
+/// numbers read as 0, as with the split.
+struct AckSubject {
+    var stream: Range<String.Index>
+    var consumer: Range<String.Index>
+    var numDelivered: UInt64 = 0
+    var streamSequence: UInt64 = 0
+    var consumerSequence: UInt64 = 0
+    var timestampNanos: Int64?
+    var numPending: UInt64 = 0
+
+    init?(_ subject: String) {
+        let utf8 = subject.utf8
+        let end = utf8.endIndex
+        var index = utf8.startIndex
+        var token = 0
+        var stream: Range<String.Index>?
+        var consumer: Range<String.Index>?
+
+        while token < 9 {
+            while index < end, utf8[index] == UInt8(ascii: ".") {
+                index = utf8.index(after: index)
+            }
+            guard index < end else { break }
+
+            let start = index
+            var value: UInt64 = 0
+            var digits = 0
+            var numeric = true
+            while index < end {
+                let byte = utf8[index]
+                if byte == UInt8(ascii: ".") { break }
+                let digit = byte &- UInt8(ascii: "0")
+                if digit < 10, digits < 19 {
+                    value = value * 10 + UInt64(digit)
+                    digits += 1
+                } else {
+                    numeric = false
+                }
+                index = utf8.index(after: index)
+            }
+            let number = numeric ? value : 0
+
+            switch token {
+            case 0:
+                guard utf8[start..<index].elementsEqual("$JS".utf8) else { return nil }
+            case 1:
+                guard utf8[start..<index].elementsEqual("ACK".utf8) else { return nil }
+            case 2: stream = start..<index
+            case 3: consumer = start..<index
+            case 4: numDelivered = number
+            case 5: streamSequence = number
+            case 6: consumerSequence = number
+            case 7: timestampNanos = numeric ? Int64(exactly: value) : nil
+            default: numPending = number
+            }
+            token += 1
         }
-        let seconds = TimeInterval(nanos) / 1_000_000_000
-        return Date(timeIntervalSince1970: seconds)
+
+        guard token == 9, let stream, let consumer else { return nil }
+        self.stream = stream
+        self.consumer = consumer
+    }
+
+    /// The token at `range` as a string, returning `known` when it spells the
+    /// same bytes.
+    func string(_ range: Range<String.Index>, in subject: String, reusing known: String) -> String {
+        subject.utf8[range].elementsEqual(known.utf8) ? known : String(subject[range])
     }
 }
 

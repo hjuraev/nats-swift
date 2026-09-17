@@ -112,14 +112,26 @@ enum SubscriptionSink: Sendable {
 /// cost. All operations are short and never suspend, so a lock is enough.
 /// Sinks are always called outside the lock.
 final class SubscriptionManager: Sendable {
-    /// Internal subscription state
-    struct SubscriptionState {
+    /// One subscription's state.
+    ///
+    /// A class so that delivering a message updates it in place: as a struct
+    /// in the dictionary, every message copied it out (retaining the sink's
+    /// closures), counted, and wrote it back — a second hash and assignment
+    /// that was most of the manager's per-message cost. Mutable fields are only
+    /// touched under the manager's lock.
+    final class SubscriptionState: @unchecked Sendable {
         let subject: String
         let queueGroup: String?
         let sink: SubscriptionSink
         var messageCount: Int = 0
         var maxMessages: Int?  // For auto-unsubscribe
         var isDraining: Bool = false  // True when unsubscribe has been initiated
+
+        init(subject: String, queueGroup: String?, sink: SubscriptionSink) {
+            self.subject = subject
+            self.queueGroup = queueGroup
+            self.sink = sink
+        }
     }
 
     private struct State {
@@ -165,9 +177,7 @@ final class SubscriptionManager: Sendable {
     /// Mark a subscription as draining (unsubscribe initiated, but may still receive in-flight messages)
     func markDraining(sid: String) {
         state.withLock { state in
-            if state.subscriptions[sid] != nil {
-                state.subscriptions[sid]?.isDraining = true
-            }
+            state.subscriptions[sid]?.isDraining = true
         }
     }
 
@@ -219,7 +229,7 @@ final class SubscriptionManager: Sendable {
         enum Outcome {
             case unknown
             case discarded
-            case deliver(SubscriptionSink, finishAfter: Bool)
+            case deliver(SubscriptionState, finishAfter: Bool)
         }
 
         let outcome: Outcome = state.withLock { state in
@@ -228,14 +238,11 @@ final class SubscriptionManager: Sendable {
                 return .discarded
             }
 
-            // Check if this is a draining subscription (in-flight messages are expected)
-            if state.drainingSubscriptions.contains(sid) {
-                // Silently discard - this is expected for in-flight messages
-                return .discarded
-            }
-
-            guard var subscription = state.subscriptions[sid] else {
-                return .unknown
+            // One lookup for the common case, an active subscription.
+            guard let subscription = state.subscriptions[sid] else {
+                // Recently unsubscribed: in-flight messages are expected and
+                // silently discarded. A sid is never both active and draining.
+                return state.drainingSubscriptions.contains(sid) ? .discarded : .unknown
             }
 
             // If subscription is draining, don't deliver new messages
@@ -249,11 +256,10 @@ final class SubscriptionManager: Sendable {
             if let max = subscription.maxMessages, subscription.messageCount >= max {
                 state.subscriptions.removeValue(forKey: sid)
                 state.drainingSubscriptions.insert(sid)
-                return .deliver(subscription.sink, finishAfter: true)
+                return .deliver(subscription, finishAfter: true)
             }
 
-            state.subscriptions[sid] = subscription
-            return .deliver(subscription.sink, finishAfter: false)
+            return .deliver(subscription, finishAfter: false)
         }
 
         switch outcome {
@@ -261,10 +267,10 @@ final class SubscriptionManager: Sendable {
             return false
         case .discarded:
             return true
-        case .deliver(let sink, let finishAfter):
-            sink.yield(message)
+        case .deliver(let subscription, let finishAfter):
+            subscription.sink.yield(message)
             if finishAfter {
-                sink.finish()
+                subscription.sink.finish()
                 scheduleDrainingCleanup(sid: sid)
             }
             return true

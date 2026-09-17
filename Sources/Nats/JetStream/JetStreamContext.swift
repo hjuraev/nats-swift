@@ -217,13 +217,7 @@ public actor JetStreamContext {
                 timeout: timeout
             )
 
-            // Check for error in response
-            if let status = response.headers?.status, status >= 400 {
-                let description = response.headers?.statusDescription ?? "Unknown error"
-                throw JetStreamError.publishFailed(description)
-            }
-
-            return try JSONDecoder().decode(PubAck.self, from: response.data)
+            return try Self.pubAck(from: response)
         } catch let error as JetStreamError {
             throw error
         } catch {
@@ -244,27 +238,35 @@ public actor JetStreamContext {
                 timeout: timeout
             )
 
-            if let status = response.headers?.status, status >= 400 {
-                let description = response.headers?.statusDescription ?? "Unknown error"
-                throw JetStreamError.publishFailed(description)
-            }
-
-            // Check for JetStream error response
-            if let errorResponse = try? JSONDecoder().decode(JSErrorResponse.self, from: response.data),
-               errorResponse.error != nil {
-                throw JetStreamError.apiError(
-                    code: errorResponse.error!.code,
-                    errorCode: errorResponse.error!.errCode,
-                    description: errorResponse.error!.description
-                )
-            }
-
-            return try JSONDecoder().decode(PubAck.self, from: response.data)
+            return try Self.pubAck(from: response)
         } catch let error as JetStreamError {
             throw error
         } catch {
             throw JetStreamError.publishFailed(error.localizedDescription)
         }
+    }
+
+    /// The ack for a JetStream publish, decoding the reply once.
+    ///
+    /// A publish reply is either an ack or an API error. The reply used to be
+    /// decoded as an error first and then again as an ack — two JSON decodes
+    /// per publish. `publish(_:payload:options:)` skipped the error decode and
+    /// reported a rejected publish as an undecodable ack; both now report
+    /// `apiError`.
+    static func pubAck(from response: NatsMessage) throws -> PubAck {
+        if let status = response.headers?.status, status >= 400 {
+            let description = response.headers?.statusDescription ?? "Unknown error"
+            throw JetStreamError.publishFailed(description)
+        }
+
+        let reply = try JSONDecoder().decode(PubAckReply.self, from: response.data)
+        if let error = reply.error {
+            throw JetStreamError.apiError(code: error.code, errorCode: error.errCode, description: error.description)
+        }
+        guard let stream = reply.stream, let seq = reply.seq else {
+            throw JetStreamError.publishFailed("Publish reply carried neither an ack nor an error")
+        }
+        return PubAck(stream: stream, seq: seq, duplicate: reply.duplicate, domain: reply.domain)
     }
 
     // MARK: - Internal Methods
@@ -440,16 +442,7 @@ public actor JetStreamContext {
                 let container = try decoder.singleValueContainer()
                 let dateString = try container.decode(String.self)
 
-                // Try ISO8601 with fractional seconds
-                let formatter = ISO8601DateFormatter()
-                formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-                if let date = formatter.date(from: dateString) {
-                    return date
-                }
-
-                // Try without fractional seconds
-                formatter.formatOptions = [.withInternetDateTime]
-                if let date = formatter.date(from: dateString) {
+                if let date = RFC3339.date(from: dateString) {
                     return date
                 }
 
@@ -463,6 +456,15 @@ public actor JetStreamContext {
 }
 
 // MARK: - Supporting Types
+
+/// A publish reply: an ack, or an API error.
+struct PubAckReply: Decodable {
+    let error: JSErrorResponse.JSError?
+    let stream: String?
+    let seq: UInt64?
+    let duplicate: Bool?
+    let domain: String?
+}
 
 /// MSG.GET by time. Only `seq` is read back.
 struct StartTimeMessageRequest: Encodable {

@@ -59,6 +59,12 @@ public actor NatsClient {
     /// `inboxPrefix` plus the separator, precomputed for the per-message check.
     private let inboxReplyPrefix: String
 
+    /// Numbers request reply subjects under `inboxPrefix`. The prefix already
+    /// carries a random token per client, so a counter is enough to keep
+    /// replies apart; a fresh 22-character random token per request cost
+    /// about 2 µs.
+    private var requestCount: UInt64 = 0
+
     // Reconnection state
     private var reconnectionState: ReconnectionState
     private var reconnectionTask: Task<Void, Never>?
@@ -559,7 +565,8 @@ public actor NatsClient {
             try await awaitCapacity(outbound)
         }
 
-        let replySubject = Subject.newInbox(prefix: inboxPrefix)
+        requestCount &+= 1
+        let replySubject = inboxReplyPrefix + String(requestCount, radix: 36)
         let effectiveTimeout = timeout ?? options.requestTimeout
         let frame = ClientOp.publish(subject: subject, reply: replySubject, headers: headers, payload: payload)
 

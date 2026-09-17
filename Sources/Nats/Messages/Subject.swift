@@ -19,33 +19,53 @@ public enum Subject {
     public static let separator: Character = "."
 
     /// Validate a subject for publishing (no wildcards allowed)
+    ///
+    /// Runs on every publish and request, so it reads the UTF-8 bytes once
+    /// instead of making a grapheme-aware pass per rule (`count`, several
+    /// `contains`). Rules, and which error a subject breaking several of them
+    /// gets, are unchanged.
     public static func validateForPublish(_ subject: String) throws(ProtocolError) {
-        guard !subject.isEmpty else {
+        let utf8 = subject.utf8
+        guard let first = utf8.first, let last = utf8.last else {
             throw .invalidSubject("Subject cannot be empty")
         }
 
-        guard subject.count <= maxLength else {
+        // Characters never outnumber bytes, so the character count is only
+        // needed when the byte count is over the limit.
+        guard utf8.count <= maxLength || subject.count <= maxLength else {
             throw .invalidSubject("Subject exceeds maximum length of \(maxLength)")
         }
 
-        guard !subject.contains(" ") else {
+        var hasSpace = false
+        var hasTab = false
+        var hasEmptyToken = false
+        var hasWildcard = false
+        var previous: UInt8 = 0
+        for byte in utf8 {
+            switch byte {
+            case UInt8(ascii: " "): hasSpace = true
+            case UInt8(ascii: "\t"): hasTab = true
+            case UInt8(ascii: "."): if previous == UInt8(ascii: ".") { hasEmptyToken = true }
+            case UInt8(ascii: "*"), UInt8(ascii: ">"): hasWildcard = true
+            default: break
+            }
+            previous = byte
+        }
+
+        guard !hasSpace else {
             throw .invalidSubject("Subject cannot contain spaces")
         }
-
-        guard !subject.contains("\t") else {
+        guard !hasTab else {
             throw .invalidSubject("Subject cannot contain tabs")
         }
-
-        guard !subject.hasPrefix(".") && !subject.hasSuffix(".") else {
+        guard first != UInt8(ascii: "."), last != UInt8(ascii: ".") else {
             throw .invalidSubject("Subject cannot start or end with a dot")
         }
-
-        guard !subject.contains("..") else {
+        guard !hasEmptyToken else {
             throw .invalidSubject("Subject cannot contain empty tokens")
         }
-
         // No wildcards allowed for publishing
-        guard !subject.contains("*") && !subject.contains(">") else {
+        guard !hasWildcard else {
             throw .invalidSubject("Wildcards not allowed in publish subject")
         }
     }
