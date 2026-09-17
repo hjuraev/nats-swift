@@ -16,7 +16,26 @@ public struct KeyValueWatchOptions: Sendable {
     /// Only receive headers (no values) — useful for key enumeration
     public var metaOnly: Bool
 
-    /// Resume watching from a specific revision (deliverPolicy: .byStartSequence)
+    /// Resume watching from a specific revision, inclusive
+    /// (deliverPolicy: .byStartSequence).
+    ///
+    /// A watcher that lost its consumer — a broker restart, the inactivity
+    /// threshold — and still holds a valid image can pass its last revision
+    /// + 1 here and receive only what changed since, instead of replaying the
+    /// whole bucket.
+    ///
+    /// Two ways the resume can miss changes, which the caller must rule out
+    /// before trusting it:
+    ///
+    /// - **The revision was purged from the head of the stream.** If
+    ///   `KeyValueBucketStatus.firstRevision` is above the resume revision,
+    ///   entries in between are gone; replay the bucket instead.
+    /// - **A delete marker after it was removed.** `purgeDeletes` removes old
+    ///   markers outright, from anywhere in the stream. A key deleted while the
+    ///   watcher was away, whose marker was then purged, never appears in the
+    ///   resumed stream, and the image keeps a key that no longer exists. Resume
+    ///   only if the watcher was away for less than the `olderThan` the bucket's
+    ///   `purgeDeletes` runs with.
     public var resumeFromRevision: UInt64?
 
     public init(
@@ -194,14 +213,35 @@ public struct KeyValueWatcher: AsyncSequence, Sendable {
                             received += 1
                         }
 
-                        // After receiving all initial pending messages, send nil sentinel
-                        if !sentInitialDone && received >= initialPending {
-                            continuation.yield(nil)
-                            sentInitialDone = true
+                        guard !sentInitialDone else { continue }
+
+                        // The initial values are done when a delivery reports
+                        // nothing pending, or when as many have arrived as were
+                        // pending at the start (the Go client's rule).
+                        if let last = messages.last {
+                            if last.metadata.numPending == 0 || received >= initialPending {
+                                continuation.yield(nil)
+                                sentInitialDone = true
+                            }
+                            continue
                         }
 
-                        if messages.isEmpty && !sentInitialDone {
-                            // No messages and no initial pending — send sentinel
+                        // An empty fetch is not the end of the initial values
+                        // by itself — a pull can come back empty with entries
+                        // still pending — so it used to signal "done" on a
+                        // partial image. Ask the consumer.
+                        var settled = initialPending == 0
+                        if !settled {
+                            // A failed refresh leaves the question open for the
+                            // next empty fetch; it does not end the watch.
+                            if (try? await consumer.refresh()) != nil {
+                                let info = await consumer.info
+                                // Delivered but not yet received entries are
+                                // still on their way through the inbox.
+                                settled = info.numPending == 0 && info.delivered.consumerSeq <= received
+                            }
+                        }
+                        if settled {
                             continuation.yield(nil)
                             sentInitialDone = true
                         }

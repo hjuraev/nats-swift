@@ -238,119 +238,76 @@ public actor KeyValueBucket {
     // MARK: - Enumeration
 
     /// List all active keys in the bucket, optionally filtered by a subject pattern.
+    ///
+    /// Holds every key in memory; for large buckets prefer `keyBatches(filter:batch:)`.
+    ///
+    /// - Throws: `incompleteListing` when the listing ends with keys still
+    ///   pending, rather than returning a partial list as if it were complete.
     public func keys(filter: String? = nil) async throws(JetStreamError) -> [String] {
-        let streamName = "KV_\(bucket)"
-        let filterSubject = filter.map { "$KV.\(bucket).\($0)" } ?? "$KV.\(bucket).>"
-
-        let consumer = try await context.createConsumer(
-            stream: streamName,
-            config: ConsumerConfig(
-                deliverPolicy: .lastPerSubject,
-                ackPolicy: .none,
-                filterSubject: filterSubject,
-                inactiveThreshold: .seconds(300),
-                memStorage: true,
-                headersOnly: true
-            )
-        )
-
-        var keys: [String] = []
-        let consumerName = await consumer.name
+        let scan = latestEntryScan(filter: filter, batch: Self.listingBatch)
         let keyPrefix = "$KV.\(bucket)."
-
-        defer {
-            Task {
-                try? await context.deleteConsumer(stream: streamName, consumer: consumerName)
-            }
+        var keys: [String] = []
+        while let messages = try await scan.next() {
+            keys += KeyValueKeyBatches.activeKeys(in: messages, keyPrefix: keyPrefix)
         }
-
-        // Fetch all pending messages
-        let info = await consumer.info
-        var remaining = Int(info.numPending)
-        if remaining == 0 {
-            return keys
-        }
-
-        while remaining > 0 {
-            let batchSize = min(remaining, 256)
-            let messages = try await consumer.fetch(batch: batchSize, maxWait: .seconds(5))
-
-            if messages.isEmpty {
-                break
-            }
-
-            for msg in messages {
-                let subject = msg.subject
-                guard subject.hasPrefix(keyPrefix) else { continue }
-                let key = String(subject.dropFirst(keyPrefix.count))
-
-                // Skip delete/purge markers
-                if let opStr = msg.headers?[NatsHeaders.Keys.kvOperation] {
-                    if opStr == "DEL" || opStr == "PURGE" {
-                        continue
-                    }
-                }
-
-                keys.append(key)
-            }
-
-            remaining -= messages.count
-        }
-
         return keys
     }
 
+    /// The bucket's active keys, a batch at a time, fetched as the caller
+    /// iterates — never more than one batch in memory.
+    ///
+    /// - Parameters:
+    ///   - filter: key pattern, as for `keys(filter:)`.
+    ///   - batch: entries fetched per round trip. Delete markers count against
+    ///     it and are dropped, so a batch can hold fewer keys.
+    public nonisolated func keyBatches(filter: String? = nil, batch: Int = 2048) -> KeyValueKeyBatches {
+        let context = self.context
+        let bucket = self.bucket
+        return KeyValueKeyBatches(keyPrefix: "$KV.\(bucket).") {
+            KeyValueScan(
+                context: context,
+                bucket: bucket,
+                filterSubject: filter.map { "$KV.\(bucket).\($0)" } ?? "$KV.\(bucket).>",
+                deliverPolicy: .lastPerSubject,
+                headersOnly: true,
+                batch: batch
+            )
+        }
+    }
+
     /// Get all history entries for a key.
+    ///
+    /// - Throws: `incompleteListing` when the history ends with entries still pending.
     public func history(_ key: String) async throws(JetStreamError) -> [KeyValueEntry] {
         try validateKey(key)
 
-        let streamName = "KV_\(bucket)"
-        let filterSubject = "$KV.\(bucket).\(key)"
-
-        let consumer = try await context.createConsumer(
-            stream: streamName,
-            config: ConsumerConfig(
-                deliverPolicy: .all,
-                ackPolicy: .none,
-                filterSubject: filterSubject,
-                inactiveThreshold: .seconds(300),
-                memStorage: true
-            )
+        let scan = KeyValueScan(
+            context: context,
+            bucket: bucket,
+            filterSubject: "$KV.\(bucket).\(key)",
+            deliverPolicy: .all,
+            headersOnly: false,
+            batch: Self.listingBatch
         )
-
         var entries: [KeyValueEntry] = []
-        let consumerName = await consumer.name
-
-        defer {
-            Task {
-                try? await context.deleteConsumer(stream: streamName, consumer: consumerName)
-            }
+        while let messages = try await scan.next() {
+            entries += messages.compactMap { KeyValueEntry.fromConsumerMessage($0, bucket: bucket) }
         }
-
-        let info = await consumer.info
-        var remaining = Int(info.numPending)
-        if remaining == 0 {
-            return entries
-        }
-
-        while remaining > 0 {
-            let batchSize = min(remaining, 256)
-            let messages = try await consumer.fetch(batch: batchSize, maxWait: .seconds(5))
-
-            if messages.isEmpty {
-                break
-            }
-
-            for msg in messages {
-                if let entry = KeyValueEntry.fromConsumerMessage(msg, bucket: bucket) {
-                    entries.append(entry)
-                }
-            }
-
-            remaining -= messages.count
-        }
-
         return entries
+    }
+
+    /// Entries per fetch for whole-bucket passes.
+    private static let listingBatch = 2048
+
+    private func latestEntryScan(filter: String?, batch: Int) -> KeyValueScan {
+        KeyValueScan(
+            context: context,
+            bucket: bucket,
+            filterSubject: filter.map { "$KV.\(bucket).\($0)" } ?? "$KV.\(bucket).>",
+            deliverPolicy: .lastPerSubject,
+            headersOnly: true,
+            batch: batch
+        )
     }
 
     // MARK: - Watch
@@ -381,73 +338,83 @@ public actor KeyValueBucket {
 
     /// Remove old delete/purge markers. Markers older than the given duration are fully purged;
     /// recent markers are kept (1 entry) to preserve tombstone semantics.
+    ///
+    /// Lists the bucket's latest entries to find the markers. A caller that
+    /// already knows them — from its own watch — should pass them to
+    /// `purgeDeletes(_:olderThan:maxConcurrent:)` and skip the listing.
+    ///
+    /// - Throws: `incompleteListing` if the listing ends early; nothing found
+    ///   up to that point is purged.
     public func purgeDeletes(olderThan: Duration? = nil) async throws(JetStreamError) {
-        let streamName = "KV_\(bucket)"
-
-        // Create a consumer to find all delete/purge markers
-        let consumer = try await context.createConsumer(
-            stream: streamName,
-            config: ConsumerConfig(
-                deliverPolicy: .lastPerSubject,
-                ackPolicy: .none,
-                filterSubject: "$KV.\(bucket).>",
-                inactiveThreshold: .seconds(300),
-                memStorage: true,
-                headersOnly: true
-            )
-        )
-
-        let consumerName = await consumer.name
-
-        defer {
-            Task {
-                try? await context.deleteConsumer(stream: streamName, consumer: consumerName)
+        let scan = latestEntryScan(filter: nil, batch: Self.listingBatch)
+        var markers: [KeyValueEntry] = []
+        while let messages = try await scan.next() {
+            for message in messages {
+                guard let entry = KeyValueEntry.fromConsumerMessage(message, bucket: bucket),
+                      entry.operation != .put else { continue }
+                markers.append(entry)
             }
         }
+        try await purgeDeletes(markers, olderThan: olderThan)
+    }
 
-        let info = await consumer.info
-        var remaining = Int(info.numPending)
-
-        var deleteSubjects: [(subject: String, isOld: Bool)] = []
+    /// Remove delete/purge markers the caller already knows about, without
+    /// listing the bucket.
+    ///
+    /// Each purge is bounded by the marker's revision, so it cannot remove a
+    /// value written after the marker: a key deleted and then put again keeps
+    /// its new value. (`purge(subject:)` has no such bound; purging by subject
+    /// alone from a stale view of the bucket deletes live data.)
+    ///
+    /// - Parameters:
+    ///   - markers: entries whose `operation` is `.delete` or `.purge`, e.g.
+    ///     from a watcher. Other entries are ignored.
+    ///   - olderThan: markers created longer ago than this are removed with
+    ///     everything before them; newer ones are kept and only the history
+    ///     before them is removed. `nil` removes every marker.
+    ///   - maxConcurrent: purge requests in flight at once.
+    /// - Returns: the number of markers acted on.
+    @discardableResult
+    public func purgeDeletes(
+        _ markers: [KeyValueEntry],
+        olderThan: Duration? = nil,
+        maxConcurrent: Int = 16
+    ) async throws(JetStreamError) -> Int {
         let now = Date()
+        let purges: [(subject: String, upToSequence: UInt64)] = markers.compactMap { marker in
+            guard marker.operation != .put else { return nil }
+            let isOld = olderThan.map { now.timeIntervalSince(marker.created) > $0.timeInterval } ?? true
+            // Old: remove the marker and everything before it. Recent: keep
+            // the marker, remove what came before it.
+            let upToSequence = isOld ? marker.revision + 1 : marker.revision
+            // A recent marker at revision 1 has no history before it.
+            guard upToSequence > 1 else { return nil }
+            return ("$KV.\(bucket).\(marker.key)", upToSequence)
+        }
+        guard !purges.isEmpty else { return 0 }
 
-        while remaining > 0 {
-            let batchSize = min(remaining, 256)
-            let messages = try await consumer.fetch(batch: batchSize, maxWait: .seconds(5))
-
-            if messages.isEmpty {
-                break
-            }
-
-            for msg in messages {
-                if let opStr = msg.headers?[NatsHeaders.Keys.kvOperation],
-                   (opStr == "DEL" || opStr == "PURGE") {
-
-                    let isOld: Bool
-                    if let threshold = olderThan {
-                        let age = now.timeIntervalSince(msg.metadata.timestamp)
-                        isOld = age > threshold.timeInterval
-                    } else {
-                        isOld = true
+        let stream = self.stream
+        let limit = max(1, maxConcurrent)
+        do {
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                var next = purges.makeIterator()
+                var running = 0
+                while running < limit, let purge = next.next() {
+                    group.addTask { _ = try await stream.purge(subject: purge.subject, upToSequence: purge.upToSequence) }
+                    running += 1
+                }
+                while try await group.next() != nil {
+                    if let purge = next.next() {
+                        group.addTask { _ = try await stream.purge(subject: purge.subject, upToSequence: purge.upToSequence) }
                     }
-
-                    deleteSubjects.append((subject: msg.subject, isOld: isOld))
                 }
             }
-
-            remaining -= messages.count
+        } catch let error as JetStreamError {
+            throw error
+        } catch {
+            throw JetStreamError.mapping(error, operation: "purgeDeletes", timeout: .zero)
         }
-
-        // Purge each delete marker subject
-        for item in deleteSubjects {
-            if item.isOld {
-                // Fully purge (remove all including the marker)
-                _ = try await stream.purge(subject: item.subject)
-            } else {
-                // Keep the latest marker but remove history
-                _ = try await stream.purge(subject: item.subject, keep: 1)
-            }
-        }
+        return purges.count
     }
 
     /// Get the current status of this bucket.
