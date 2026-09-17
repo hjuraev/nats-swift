@@ -91,6 +91,37 @@ struct WireParsingTests {
         #expect(headers["Nats-Msg-Size"] == "2")
     }
 
+    @Test("RFC 3339 timestamps parse like ISO8601DateFormatter")
+    func rfc3339MatchesFoundation() throws {
+        let samples = [
+            "2026-09-17T03:19:04.576735Z",
+            "2026-09-17T03:19:04Z",
+            "2026-09-17T03:19:04.5Z",
+            "2026-09-17T03:19:04.123456789Z",
+            "1970-01-01T00:00:00Z",
+            "2000-02-29T23:59:59.999Z",
+            "2026-09-17T08:19:04.25+05:00",
+            "2026-09-16T22:19:04-05:00",
+        ]
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let plain = ISO8601DateFormatter()
+        plain.formatOptions = [.withInternetDateTime]
+        for sample in samples {
+            let fast = try #require(RFC3339.fastDate(from: sample), "fast path rejected \(sample)")
+            let reference = try #require(formatter.date(from: sample) ?? plain.date(from: sample))
+            // The formatter keeps milliseconds; the fast path keeps nanoseconds.
+            #expect(abs(fast.timeIntervalSince(reference)) < 0.001, "\(sample): \(fast) vs \(reference)")
+        }
+    }
+
+    @Test("Malformed timestamps are rejected by the fast path")
+    func rfc3339Rejects() {
+        for sample in ["", "2026-09-17", "2026-13-01T00:00:00Z", "2026-09-17T24:00:00Z", "2026-09-17T03:19:04", "2026-09-17T03:19:04.Z", "2026-09-17T03:19:04Zjunk"] {
+            #expect(RFC3339.fastDate(from: sample) == nil, "accepted \(sample)")
+        }
+    }
+
     @Test("Ack subject fields")
     func ackSubject() throws {
         let subject = "$JS.ACK.KV_bucket.watcher.2.1234.567.1789615116499918000.42"
