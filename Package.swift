@@ -35,6 +35,16 @@ let package = Package(
             name: "NatsTests",
             dependencies: ["Nats"]
         ),
+        // Not a product: dependents never build it.
+        // `swift run -c release NatsBenchmarks` — see the file header.
+        .executableTarget(
+            name: "NatsBenchmarks",
+            dependencies: [
+                "Nats",
+                .product(name: "Logging", package: "swift-log"),
+            ],
+            path: "Benchmarks/NatsBenchmarks"
+        ),
     ],
     swiftLanguageModes: [.v6]
 )
