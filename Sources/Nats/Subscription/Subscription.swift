@@ -3,6 +3,7 @@
 // Licensed under the Apache License, Version 2.0
 
 import Foundation
+import Synchronization
 
 /// A subscription to a NATS subject that delivers messages as an AsyncSequence
 public struct Subscription: AsyncSequence, Sendable {
@@ -72,122 +73,202 @@ public struct Subscription: AsyncSequence, Sendable {
 
 // MARK: - Subscription Manager
 
-/// Manages active subscriptions for a client
-actor SubscriptionManager {
+/// Where a subscription's messages go.
+enum SubscriptionSink: Sendable {
+    /// A public `Subscription`, read through its async stream.
+    case stream(AsyncStream<NatsMessage>.Continuation)
+
+    /// An internal consumer that takes messages inline on the delivery path.
+    ///
+    /// For the client's own inboxes (request replies, pull consumers), which
+    /// would otherwise pay a task wake-up per message to read their own stream.
+    /// `onMessage` runs on the client's inbound path and must not block.
+    case handler(onMessage: @Sendable (NatsMessage) -> Void, onFinish: @Sendable () -> Void)
+
+    func yield(_ message: NatsMessage) {
+        switch self {
+        case .stream(let continuation):
+            continuation.yield(message)
+        case .handler(let onMessage, _):
+            onMessage(message)
+        }
+    }
+
+    func finish() {
+        switch self {
+        case .stream(let continuation):
+            continuation.finish()
+        case .handler(_, let onFinish):
+            onFinish()
+        }
+    }
+}
+
+/// Manages active subscriptions for a client.
+///
+/// A lock-protected class rather than an actor. Every inbound message is
+/// looked up here, and as an actor that lookup cost two executor hops per
+/// message — measured as the largest single share of the client's per-message
+/// cost. All operations are short and never suspend, so a lock is enough.
+/// Sinks are always called outside the lock.
+final class SubscriptionManager: Sendable {
     /// Internal subscription state
     struct SubscriptionState {
         let subject: String
         let queueGroup: String?
-        let continuation: AsyncStream<NatsMessage>.Continuation
+        let sink: SubscriptionSink
         var messageCount: Int = 0
         var maxMessages: Int?  // For auto-unsubscribe
         var isDraining: Bool = false  // True when unsubscribe has been initiated
     }
 
-    private var subscriptions: [String: SubscriptionState] = [:]
-    private var drainingSubscriptions: Set<String> = []  // Track recently unsubscribed for in-flight messages
-    private var nextSid: UInt64 = 0
-    private var isClosed = false  // When true, all messages are silently discarded
+    private struct State {
+        var subscriptions: [String: SubscriptionState] = [:]
+        var drainingSubscriptions: Set<String> = []  // Track recently unsubscribed for in-flight messages
+        var nextSid: UInt64 = 0
+        var isClosed = false  // When true, all messages are silently discarded
+    }
+
+    private let state = Mutex(State())
 
     /// Generate a new subscription ID
     func generateSid() -> String {
-        nextSid += 1
-        return String(nextSid)
+        state.withLock { state in
+            state.nextSid += 1
+            return String(state.nextSid)
+        }
     }
 
-    /// Register a new subscription
+    /// Register a new subscription delivered through an async stream.
     func register(
         sid: String,
         subject: String,
         queueGroup: String?,
         continuation: AsyncStream<NatsMessage>.Continuation
     ) {
-        // Remove from draining set if being reused
-        drainingSubscriptions.remove(sid)
-        subscriptions[sid] = SubscriptionState(
-            subject: subject,
-            queueGroup: queueGroup,
-            continuation: continuation
-        )
+        register(sid: sid, subject: subject, queueGroup: queueGroup, sink: .stream(continuation))
+    }
+
+    /// Register a new subscription
+    func register(sid: String, subject: String, queueGroup: String?, sink: SubscriptionSink) {
+        state.withLock { state in
+            // Remove from draining set if being reused
+            state.drainingSubscriptions.remove(sid)
+            state.subscriptions[sid] = SubscriptionState(
+                subject: subject,
+                queueGroup: queueGroup,
+                sink: sink
+            )
+        }
     }
 
     /// Mark a subscription as draining (unsubscribe initiated, but may still receive in-flight messages)
     func markDraining(sid: String) {
-        if subscriptions[sid] != nil {
-            subscriptions[sid]?.isDraining = true
+        state.withLock { state in
+            if state.subscriptions[sid] != nil {
+                state.subscriptions[sid]?.isDraining = true
+            }
         }
     }
 
     /// Unregister a subscription
     func unregister(sid: String) {
-        if let state = subscriptions.removeValue(forKey: sid) {
-            state.continuation.finish()
+        let removed: SubscriptionState? = state.withLock { state in
+            guard let removed = state.subscriptions.removeValue(forKey: sid) else { return nil }
             // Track as draining for a short period to handle in-flight messages
-            drainingSubscriptions.insert(sid)
-            // Schedule cleanup of draining set
-            Task { [weak self] in
-                try? await Task.sleep(for: .milliseconds(500))
-                await self?.cleanupDraining(sid: sid)
-            }
+            state.drainingSubscriptions.insert(sid)
+            return removed
+        }
+        guard let removed else { return }
+        removed.sink.finish()
+        scheduleDrainingCleanup(sid: sid)
+    }
+
+    /// Drop `sid` from the draining set once in-flight messages have had time to land.
+    private func scheduleDrainingCleanup(sid: String) {
+        Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(500))
+            self?.cleanupDraining(sid: sid)
         }
     }
 
-    /// Remove from draining set (async to allow actor-isolated access from Task)
-    private func cleanupDraining(sid: String) async {
-        drainingSubscriptions.remove(sid)
+    private func cleanupDraining(sid: String) {
+        _ = state.withLock { state in
+            state.drainingSubscriptions.remove(sid)
+        }
     }
 
     /// Set auto-unsubscribe limit
     func setAutoUnsubscribe(sid: String, max: Int) {
-        subscriptions[sid]?.maxMessages = max
+        state.withLock { state in
+            state.subscriptions[sid]?.maxMessages = max
+        }
     }
 
     /// Check if a subscription is known (active or draining)
     func isKnown(sid: String) -> Bool {
-        subscriptions[sid] != nil || drainingSubscriptions.contains(sid)
+        state.withLock { state in
+            state.subscriptions[sid] != nil || state.drainingSubscriptions.contains(sid)
+        }
     }
 
     /// Deliver a message to a subscription
     /// Returns true if delivered or if subscription is draining (to avoid warnings)
     /// Returns false only if subscription is completely unknown
     func deliver(sid: String, message: NatsMessage) -> Bool {
-        // If manager is closed, silently discard all messages
-        if isClosed {
-            return true
+        enum Outcome {
+            case unknown
+            case discarded
+            case deliver(SubscriptionSink, finishAfter: Bool)
         }
 
-        // Check if this is a draining subscription (in-flight messages are expected)
-        if drainingSubscriptions.contains(sid) {
-            // Silently discard - this is expected for in-flight messages
-            return true
+        let outcome: Outcome = state.withLock { state in
+            // If manager is closed, silently discard all messages
+            if state.isClosed {
+                return .discarded
+            }
+
+            // Check if this is a draining subscription (in-flight messages are expected)
+            if state.drainingSubscriptions.contains(sid) {
+                // Silently discard - this is expected for in-flight messages
+                return .discarded
+            }
+
+            guard var subscription = state.subscriptions[sid] else {
+                return .unknown
+            }
+
+            // If subscription is draining, don't deliver new messages
+            if subscription.isDraining {
+                return .discarded
+            }
+
+            subscription.messageCount += 1
+
+            // Check for auto-unsubscribe
+            if let max = subscription.maxMessages, subscription.messageCount >= max {
+                state.subscriptions.removeValue(forKey: sid)
+                state.drainingSubscriptions.insert(sid)
+                return .deliver(subscription.sink, finishAfter: true)
+            }
+
+            state.subscriptions[sid] = subscription
+            return .deliver(subscription.sink, finishAfter: false)
         }
 
-        guard var state = subscriptions[sid] else {
+        switch outcome {
+        case .unknown:
             return false
-        }
-
-        // If subscription is draining, don't deliver new messages
-        if state.isDraining {
+        case .discarded:
             return true
-        }
-
-        state.messageCount += 1
-        state.continuation.yield(message)
-
-        // Check for auto-unsubscribe
-        if let max = state.maxMessages, state.messageCount >= max {
-            state.continuation.finish()
-            subscriptions.removeValue(forKey: sid)
-            drainingSubscriptions.insert(sid)
-            Task { [weak self] in
-                try? await Task.sleep(for: .milliseconds(500))
-                await self?.cleanupDraining(sid: sid)
+        case .deliver(let sink, let finishAfter):
+            sink.yield(message)
+            if finishAfter {
+                sink.finish()
+                scheduleDrainingCleanup(sid: sid)
             }
             return true
         }
-
-        subscriptions[sid] = state
-        return true
     }
 
     /// Get all active subscriptions (for resubscription after a reconnect).
@@ -196,28 +277,34 @@ actor SubscriptionManager {
     /// deliver before auto-unsubscribing — i.e. the original limit minus what
     /// has already been delivered — or `nil` for subscriptions without a limit.
     func getAllSubscriptions() -> [(sid: String, subject: String, queueGroup: String?, remainingMax: Int?)] {
-        subscriptions.compactMap { sid, state in
-            guard !state.isDraining else { return nil }
-            let remainingMax = state.maxMessages.map { max(0, $0 - state.messageCount) }
-            return (sid, state.subject, state.queueGroup, remainingMax)
+        state.withLock { state in
+            state.subscriptions.compactMap { sid, subscription in
+                guard !subscription.isDraining else { return nil }
+                let remainingMax = subscription.maxMessages.map { max(0, $0 - subscription.messageCount) }
+                return (sid, subscription.subject, subscription.queueGroup, remainingMax)
+            }
         }
     }
 
     /// Finish all subscriptions (on disconnect)
     func finishAll() {
-        // Move all active subscriptions to draining before clearing
-        // This allows in-flight messages to be silently discarded
-        for sid in subscriptions.keys {
-            drainingSubscriptions.insert(sid)
+        let sinks: [SubscriptionSink] = state.withLock { state in
+            // Move all active subscriptions to draining before clearing
+            // This allows in-flight messages to be silently discarded
+            for sid in state.subscriptions.keys {
+                state.drainingSubscriptions.insert(sid)
+            }
+            let sinks = state.subscriptions.values.map(\.sink)
+            state.subscriptions.removeAll()
+            // Keep drainingSubscriptions populated to absorb in-flight messages
+            // They will be cleaned up by their individual timeout tasks
+            // Also mark as closed to reject all future messages silently
+            state.isClosed = true
+            return sinks
         }
-        for state in subscriptions.values {
-            state.continuation.finish()
+        for sink in sinks {
+            sink.finish()
         }
-        subscriptions.removeAll()
-        // Keep drainingSubscriptions populated to absorb in-flight messages
-        // They will be cleaned up by their individual timeout tasks
-        // Also mark as closed to reject all future messages silently
-        isClosed = true
     }
 
     /// Clear the closed latch so this manager can serve a new connection.
@@ -228,12 +315,16 @@ actor SubscriptionManager {
     /// for the lifetime of the process, and any subscription created afterwards
     /// received nothing while looking perfectly healthy.
     func reopen() {
-        isClosed = false
-        drainingSubscriptions.removeAll()
+        state.withLock { state in
+            state.isClosed = false
+            state.drainingSubscriptions.removeAll()
+        }
     }
 
     /// Count of active subscriptions
     var count: Int {
-        subscriptions.filter { !$0.value.isDraining }.count
+        state.withLock { state in
+            state.subscriptions.filter { !$0.value.isDraining }.count
+        }
     }
 }

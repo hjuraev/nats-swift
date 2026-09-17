@@ -264,15 +264,15 @@ struct SubscriptionManagerDrainTests {
     @Test("markDraining sets isDraining flag")
     func markDrainingSetsFlag() async {
         let manager = SubscriptionManager()
-        let sid = await manager.generateSid()
+        let sid = manager.generateSid()
 
         let (stream, continuation) = AsyncStream<NatsMessage>.makeStream()
         _ = stream  // Silence unused warning
 
-        await manager.register(sid: sid, subject: "test", queueGroup: nil, continuation: continuation)
+        manager.register(sid: sid, subject: "test", queueGroup: nil, continuation: continuation)
 
         // Mark as draining
-        await manager.markDraining(sid: sid)
+        manager.markDraining(sid: sid)
 
         // Messages should not be delivered to draining subscriptions
         let message = NatsMessage(
@@ -282,7 +282,7 @@ struct SubscriptionManagerDrainTests {
             payload: Data()
         )
 
-        let delivered = await manager.deliver(sid: sid, message: message)
+        let delivered = manager.deliver(sid: sid, message: message)
         #expect(delivered == true)  // Returns true but doesn't actually deliver
     }
 
@@ -290,21 +290,21 @@ struct SubscriptionManagerDrainTests {
     func finishAllFinishesContinuations() async {
         let manager = SubscriptionManager()
 
-        let sid1 = await manager.generateSid()
-        let sid2 = await manager.generateSid()
+        let sid1 = manager.generateSid()
+        let sid2 = manager.generateSid()
 
         let (stream1, continuation1) = AsyncStream<NatsMessage>.makeStream()
         let (stream2, continuation2) = AsyncStream<NatsMessage>.makeStream()
 
-        await manager.register(sid: sid1, subject: "test1", queueGroup: nil, continuation: continuation1)
-        await manager.register(sid: sid2, subject: "test2", queueGroup: nil, continuation: continuation2)
+        manager.register(sid: sid1, subject: "test1", queueGroup: nil, continuation: continuation1)
+        manager.register(sid: sid2, subject: "test2", queueGroup: nil, continuation: continuation2)
 
-        #expect(await manager.count == 2)
+        #expect(manager.count == 2)
 
         // Finish all
-        await manager.finishAll()
+        manager.finishAll()
 
-        #expect(await manager.count == 0)
+        #expect(manager.count == 0)
 
         // Streams should now return nil immediately
         var iterator1 = stream1.makeAsyncIterator()
