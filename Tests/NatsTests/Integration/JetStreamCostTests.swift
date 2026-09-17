@@ -492,6 +492,71 @@ struct JetStreamCostTests {
         #expect(resumed == ["k5", "k6", "k7"])
     }
 
+    @Test("A watcher's replay does not wait out the pull expiry on its last batch", .timeLimit(.minutes(1)))
+    func watchReplayDoesNotStall() async throws {
+        guard let h = try await harness(port: 14280) else { return }
+        defer { Task { await h.tearDown() } }
+
+        // Not a multiple of the watcher's batch, so the last pull is partial.
+        let kv = try await bucket(h.js, "REPLAY", keys: 300)
+
+        let started = ContinuousClock.now
+        var received = 0
+        let watcher = try await kv.watchAll()
+        for try await entry in watcher {
+            guard entry != nil else { break }
+            received += 1
+        }
+        let elapsed = ContinuousClock.now - started
+        try await watcher.stop()
+
+        #expect(received == 300)
+        #expect(elapsed < .seconds(2), "replay of 300 keys took \(elapsed); the last partial pull waited for its expiry")
+    }
+
+    @Test("A caught-up watcher delivers an update as it happens", .timeLimit(.minutes(1)))
+    func caughtUpWatcherIsPrompt() async throws {
+        guard let h = try await harness(port: 14281) else { return }
+        defer { Task { await h.tearDown() } }
+
+        let kv = try await h.js.createKeyValue(KeyValueConfig(bucket: "PROMPT"))
+        try await kv.put("seed", value: "v")
+
+        let watcher = try await kv.watchAll()
+        let caughtUp = ResultBox<Bool>()
+        let updateArrived = ResultBox<ContinuousClock.Instant>()
+        let reader = Task {
+            for try await entry in watcher {
+                guard let entry else {
+                    caughtUp.set(true)
+                    continue
+                }
+                if entry.key == "update" {
+                    updateArrived.set(ContinuousClock.now)
+                    return
+                }
+            }
+        }
+        defer { reader.cancel() }
+
+        let ready = await boundedly(.seconds(10)) { () -> Bool in
+            while caughtUp.value == nil { try? await Task.sleep(for: .milliseconds(10)) }
+            return true
+        }
+        #expect(ready == true, "the watcher never delivered its initial values")
+
+        let putAt = ContinuousClock.now
+        try await kv.put("update", value: "v")
+        let update = await boundedly(.seconds(10)) { () -> Duration in
+            while updateArrived.value == nil { try? await Task.sleep(for: .milliseconds(5)) }
+            return updateArrived.value! - putAt
+        }
+        try await watcher.stop()
+
+        let latency = try #require(update, "the update never arrived")
+        #expect(latency < .seconds(1), "update took \(latency) to reach a caught-up watcher")
+    }
+
     // MARK: - Connection paths
 
     @Test("Concurrent first requests share one inbox subscription", .timeLimit(.minutes(1)))

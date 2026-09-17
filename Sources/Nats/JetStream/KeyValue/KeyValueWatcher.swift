@@ -150,6 +150,9 @@ public struct KeyValueWatcher: AsyncSequence, Sendable {
         }
     }
 
+    /// Largest pull a watcher makes.
+    static let maxBatch = 256
+
     /// Create a new watcher
     static func create(
         context: JetStreamContext,
@@ -202,15 +205,29 @@ public struct KeyValueWatcher: AsyncSequence, Sendable {
             let pump = Task {
                 var received: UInt64 = 0
                 var sentInitialDone = options.updatesOnly  // If updatesOnly, skip initial done sentinel
+                // What the consumer reported still to deliver, as of the last delivery.
+                var pending = initialPending
+                let keyPrefix = "$KV.\(bucket)."
 
                 while !Task.isCancelled {
                     do {
-                        let messages = try await consumer.fetch(batch: 256, maxWait: .seconds(5))
+                        // Never ask for more than is pending. A pull the stream
+                        // cannot fill is held by the server until it expires:
+                        // every replay ended with a 5 s stall on its last
+                        // partial batch, and a watcher that had caught up
+                        // delivered each update up to 5 s late. Caught up, it
+                        // pulls one at a time and an update arrives as it
+                        // happens; a burst raises `pending` and the batch size.
+                        let batch = Int(Swift.min(UInt64(Self.maxBatch), Swift.max(pending, 1)))
+                        let messages = try await consumer.fetch(batch: batch, maxWait: .seconds(5))
 
                         for msg in messages {
-                            let entry = KeyValueEntry.fromConsumerMessage(msg, bucket: bucket)
+                            let entry = KeyValueEntry.fromConsumerMessage(msg, bucket: bucket, keyPrefix: keyPrefix)
                             continuation.yield(entry)
                             received += 1
+                        }
+                        if let last = messages.last {
+                            pending = last.metadata.numPending
                         }
 
                         guard !sentInitialDone else { continue }

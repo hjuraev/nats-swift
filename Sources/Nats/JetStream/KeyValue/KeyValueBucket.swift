@@ -290,8 +290,9 @@ public actor KeyValueBucket {
             batch: Self.listingBatch
         )
         var entries: [KeyValueEntry] = []
+        let keyPrefix = "$KV.\(bucket)."
         while let messages = try await scan.next() {
-            entries += messages.compactMap { KeyValueEntry.fromConsumerMessage($0, bucket: bucket) }
+            entries += messages.compactMap { KeyValueEntry.fromConsumerMessage($0, bucket: bucket, keyPrefix: keyPrefix) }
         }
         return entries
     }
@@ -348,9 +349,10 @@ public actor KeyValueBucket {
     public func purgeDeletes(olderThan: Duration? = nil) async throws(JetStreamError) {
         let scan = latestEntryScan(filter: nil, batch: Self.listingBatch)
         var markers: [KeyValueEntry] = []
+        let keyPrefix = "$KV.\(bucket)."
         while let messages = try await scan.next() {
             for message in messages {
-                guard let entry = KeyValueEntry.fromConsumerMessage(message, bucket: bucket),
+                guard let entry = KeyValueEntry.fromConsumerMessage(message, bucket: bucket, keyPrefix: keyPrefix),
                       entry.operation != .put else { continue }
                 markers.append(entry)
             }

@@ -4,7 +4,7 @@
 
 // Throughput benchmarks for the client's hot paths (nats#2).
 //
-//     swift run -c release NatsBenchmarks [publish|put|fetch|keys|all]
+//     swift run -c release NatsBenchmarks [publish|subscribe|put|get|fetch|keys|watch|all]
 //
 // Needs a JetStream-enabled server at NATS_URL (default nats://127.0.0.1:4222).
 // Creates and deletes its own streams and buckets (prefix BENCH_).
@@ -146,14 +146,97 @@ func benchKeys() async throws {
     await client.close()
 }
 
+/// Concurrent KV gets of existing keys.
+func benchGet() async throws {
+    let client = try await connect()
+    let js = try await client.jetStream()
+    try? await js.deleteKeyValue("BENCH_GET")
+    let kv = try await js.createKeyValue(KeyValueConfig(bucket: "BENCH_GET"))
+    for i in 0..<1024 {
+        try await kv.put("k\(i)", value: "value-\(i)")
+    }
+
+    let count = 50_000
+    let start = ContinuousClock.now
+    try await withThrowingTaskGroup(of: Void.self) { group in
+        var next = 0
+        for _ in 0..<64 {
+            let i = next; next += 1
+            group.addTask { _ = try await kv.get("k\(i % 1024)") }
+        }
+        while try await group.next() != nil, next < count {
+            let i = next; next += 1
+            group.addTask { _ = try await kv.get("k\(i % 1024)") }
+        }
+        try await group.waitForAll()
+    }
+    report("kv.get, 64 in flight", count, start)
+
+    try? await js.deleteKeyValue("BENCH_GET")
+    await client.close()
+}
+
+/// A watcher's initial replay of a large bucket.
+func benchWatch() async throws {
+    let client = try await connect()
+    let js = try await client.jetStream()
+    let kv = try await fillBucket(js, client, name: "BENCH_WATCH", keys: 200_000)
+
+    let start = ContinuousClock.now
+    var received = 0
+    let watcher = try await kv.watchAll()
+    for try await entry in watcher {
+        guard entry != nil else { break }
+        received += 1
+    }
+    try await watcher.stop()
+    report("kv.watchAll() replay, 200k keys", received, start, unit: "keys")
+
+    try? await js.deleteKeyValue("BENCH_WATCH")
+    await client.close()
+}
+
+/// Core subscription throughput, publisher and subscriber on separate connections.
+func benchSubscribe() async throws {
+    let subscriber = try await connect()
+    let publisher = try await connect()
+    let subscription = try await subscriber.subscribe("BENCH.sub")
+    try await Task.sleep(for: .milliseconds(200))
+
+    let count = 200_000
+    let payload = ByteBuffer(string: String(repeating: "x", count: 64))
+    let start = ContinuousClock.now
+    let pump = Task {
+        for _ in 0..<count {
+            try await publisher.publish("BENCH.sub", payload: payload)
+        }
+    }
+    var received = 0
+    for await _ in subscription {
+        received += 1
+        if received == count { break }
+    }
+    report("subscribe, receive 64 B", received, start)
+    _ = try? await pump.value
+
+    await publisher.close()
+    await subscriber.close()
+}
+
 switch mode {
 case "publish": try await benchPublish()
 case "put": try await benchPut()
 case "fetch": try await benchFetch()
 case "keys": try await benchKeys()
+case "get": try await benchGet()
+case "watch": try await benchWatch()
+case "subscribe": try await benchSubscribe()
 default:
     try await benchPublish()
+    try await benchSubscribe()
     try await benchPut()
+    try await benchGet()
     try await benchFetch()
     try await benchKeys()
+    try await benchWatch()
 }
