@@ -25,8 +25,9 @@ final class StalledPeer: Sendable {
         /// and stays there.
         case silent
 
-        /// Accept, send a valid INFO, then never drain the receive window, so
-        /// the client's CONNECT write has nowhere to go once buffers fill.
+        /// Accept, send a valid INFO, answer the client's handshake PING, then
+        /// never drain the receive window again, so later writes have nowhere
+        /// to go once buffers fill. The client completes its connect.
         case sendInfoThenStopReading
 
         /// Accept and never read at all — a TCP zero-window peer. Saturates the
@@ -38,19 +39,26 @@ final class StalledPeer: Sendable {
         /// handshake completes, so anything written after this stalls.
         case sendTLSInfoThenStall
 
+        /// Accept, send INFO, and once the client's CONNECT and PING arrive,
+        /// wait `delay` and reject: `-ERR 'Authorization Violation'`, then
+        /// close — what a server does with credentials it does not accept,
+        /// arriving later than a fixed confirmation window would allow for.
+        case rejectConnect(after: Duration)
+
         /// Whether this behaviour writes an INFO frame on connect.
         var sendsInfo: Bool {
             switch self {
             case .silent, .stopReading: return false
-            case .sendInfoThenStopReading, .sendTLSInfoThenStall: return true
+            case .sendInfoThenStopReading, .sendTLSInfoThenStall, .rejectConnect: return true
             }
         }
 
-        /// Whether the peer should keep draining its receive window.
+        /// Whether the peer should read from the start. `sendInfoThenStopReading`
+        /// reads until the handshake PING and then stops.
         var reads: Bool {
             switch self {
-            case .silent: return true
-            case .sendInfoThenStopReading, .stopReading, .sendTLSInfoThenStall: return false
+            case .silent, .sendInfoThenStopReading, .rejectConnect: return true
+            case .stopReading, .sendTLSInfoThenStall: return false
             }
         }
 
@@ -107,12 +115,15 @@ final class StalledPeer: Sendable {
     }
 }
 
-/// Writes the configured greeting on connect and then does nothing else.
+/// Writes the configured greeting on connect, answers the handshake where the
+/// behaviour calls for it, and otherwise does nothing.
 private final class StalledPeerHandler: ChannelInboundHandler {
     typealias InboundIn = ByteBuffer
     typealias OutboundOut = ByteBuffer
 
     private let behaviour: StalledPeer.Behaviour
+    private var received = ""
+    private var answered = false
 
     init(behaviour: StalledPeer.Behaviour) {
         self.behaviour = behaviour
@@ -127,7 +138,34 @@ private final class StalledPeerHandler: ChannelInboundHandler {
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
-        // Deliberately ignored. These peers never answer.
+        // Only the handshake is ever answered, once; everything else is ignored.
+        guard !answered else { return }
+        let buffer = unwrapInboundIn(data)
+        received += buffer.getString(at: buffer.readerIndex, length: buffer.readableBytes) ?? ""
+        guard received.contains("PING\r\n") else { return }
+        answered = true
+
+        switch behaviour {
+        case .sendInfoThenStopReading:
+            var pong = context.channel.allocator.buffer(capacity: 8)
+            pong.writeString("PONG\r\n")
+            context.writeAndFlush(wrapOutboundOut(pong), promise: nil)
+            // From here on, never drain the receive window.
+            context.channel.setOption(ChannelOptions.autoRead, value: false).whenComplete { _ in }
+
+        case .rejectConnect(let delay):
+            let channel = context.channel
+            context.eventLoop.scheduleTask(in: TimeAmount(delay)) {
+                var error = channel.allocator.buffer(capacity: 64)
+                error.writeString("-ERR 'Authorization Violation'\r\n")
+                channel.writeAndFlush(error).whenComplete { _ in
+                    channel.close(promise: nil)
+                }
+            }
+
+        case .silent, .stopReading, .sendTLSInfoThenStall:
+            break
+        }
     }
 
     /// A minimal INFO the client's decoder accepts. Keys must match

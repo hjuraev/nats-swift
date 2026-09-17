@@ -86,13 +86,19 @@ final class OutboundQueue: Sendable {
     /// by the flush deadline, and by the caller's own deadline through closing
     /// the channel.
     func enqueueAndWait(_ op: ClientOp) async throws {
+        try await enqueueTracked(op).get()
+    }
+
+    /// Queue `op` and return a future for its write to the socket, so more
+    /// frames can be queued behind it before waiting.
+    func enqueueTracked(_ op: ClientOp) -> EventLoopFuture<Void> {
         let written = channel.eventLoop.makePromise(of: Void.self)
         do {
             try enqueue(op, written: written)
         } catch {
             written.fail(error)
         }
-        try await written.futureResult.get()
+        return written.futureResult
     }
 
     /// Give frames already queued a bounded chance to reach the socket.

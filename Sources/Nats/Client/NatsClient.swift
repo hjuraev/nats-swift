@@ -96,8 +96,13 @@ public actor NatsClient {
     // nothing will ever resume.
     private var pendingHandshakeResult: Result<Void, any Error>?
 
-    // Track if we're waiting for connection confirmation (to catch auth errors)
+    // Whether CONNECT has been sent and the server's verdict — PONG or -ERR —
+    // is still outstanding, and the INFO it answered.
     private var awaitingConnectionConfirmation: Bool = false
+    private var pendingConnectInfo: ServerInfo?
+
+    /// CONNECTs the server rejected with an -ERR, counted for tests.
+    private(set) var handshakeRejectionsForTesting = 0
 
     // Track if TLS is being used for current connection
     private var usingTLS: Bool = false
@@ -236,6 +241,8 @@ public actor NatsClient {
     private func beginHandshake() {
         handshakeInFlight = true
         handshakeInfoReceived = false
+        awaitingConnectionConfirmation = false
+        pendingConnectInfo = nil
         pendingHandshakeResult = nil
         connectContinuation = nil
         tlsHandshakeCompleted = false
@@ -244,6 +251,8 @@ public actor NatsClient {
     /// Mark the attempt finished and drop any state it left behind.
     private func endHandshake() {
         handshakeInFlight = false
+        awaitingConnectionConfirmation = false
+        pendingConnectInfo = nil
         pendingHandshakeResult = nil
         connectContinuation = nil
     }
@@ -349,6 +358,8 @@ public actor NatsClient {
         guard handshakeInFlight else { return }
 
         settleHandshake(.failure(error))
+        awaitingConnectionConfirmation = false
+        pendingConnectInfo = nil
         logger.info("Connect attempt abandoned: \(error)")
 
         if let channel {
@@ -908,8 +919,11 @@ public actor NatsClient {
             break
 
         case .pong:
-            // Handled by ConnectionHandler
-            break
+            // Ping bookkeeping is ConnectionHandler's. The first PONG after
+            // CONNECT is also the server's acceptance of it.
+            if awaitingConnectionConfirmation {
+                confirmConnection()
+            }
 
         case .ok:
             logger.trace("Received +OK")
@@ -919,6 +933,8 @@ public actor NatsClient {
             // Check if this is an auth error during connection
             if awaitingConnectionConfirmation {
                 awaitingConnectionConfirmation = false
+                pendingConnectInfo = nil
+                handshakeRejectionsForTesting += 1
                 let error: ConnectionError
                 if message.lowercased().contains("authorization") || message.lowercased().contains("authentication") {
                     error = .authenticationFailed(reason: message)
@@ -976,47 +992,56 @@ public actor NatsClient {
             }
         }
 
-        // Send CONNECT
+        // Send CONNECT, then PING.
+        //
+        // The server handles them in order and answers the PING only once it
+        // has accepted the CONNECT, so the PONG is the acceptance and an -ERR
+        // ahead of it is the rejection (both handled in `process(_:)`). This
+        // replaces sleeping 250 ms and treating "no -ERR yet" as accepted: a
+        // server slower than that — one restarting, say — was reported as
+        // connected, subscriptions were re-sent on a session it then rejected,
+        // and every connect paid the 250 ms. The connect deadline bounds the
+        // wait for a verdict.
         let connectInfo = buildConnectInfo(serverInfo: info)
         do {
-            // Mark that we're waiting for connection confirmation
-            // This allows us to catch -ERR responses (auth failures) before confirming
-            awaitingConnectionConfirmation = true
-
-            // Awaited to the socket, unlike other frames: over TLS this write
-            // completes only once the handshake has, which is what lets a
-            // stalled handshake be reported as one.
             guard let outbound else {
                 throw ConnectionError.closed
             }
-            try await outbound.enqueueAndWait(.connect(connectInfo))
+            awaitingConnectionConfirmation = true
+            pendingConnectInfo = info
 
-            // Small delay to allow -ERR to arrive before confirming connection
-            // This catches auth failures that arrive shortly after CONNECT
-            try? await Task.sleep(for: .milliseconds(250))
-
-            // Only proceed if we're still awaiting confirmation (not cancelled by -ERR handler)
-            guard awaitingConnectionConfirmation else {
-                // Auth or other error occurred - don't complete connection
-                return
-            }
-
-            awaitingConnectionConfirmation = false
-            _ = stateMachine.transition(on: .connected(info))
-            logger.info("Connected to NATS server")
-
-            // Start ping timer
-            if let handler = connectionHandler {
-                let interval = TimeAmount(options.pingInterval)
-                handler.startPingTimer(interval: interval)
-            }
-
-            settleHandshake(.success(()))
+            // CONNECT is awaited to the socket, unlike other frames: over TLS
+            // the write completes only once the handshake has, which is what
+            // lets a stalled handshake be reported as one.
+            let connectWritten = outbound.enqueueTracked(.connect(connectInfo))
+            try outbound.enqueue(.ping)
+            try await connectWritten.get()
         } catch {
+            // The verdict may already have arrived and settled the attempt.
+            guard awaitingConnectionConfirmation else { return }
             awaitingConnectionConfirmation = false
+            pendingConnectInfo = nil
             logger.error("Failed to send CONNECT: \(error)")
             settleHandshake(.failure(ConnectionError.io(error.localizedDescription)))
         }
+    }
+
+    /// The server answered the PING sent after CONNECT: the session is accepted.
+    private func confirmConnection() {
+        guard handshakeInFlight, let info = pendingConnectInfo else { return }
+        awaitingConnectionConfirmation = false
+        pendingConnectInfo = nil
+
+        _ = stateMachine.transition(on: .connected(info))
+        logger.info("Connected to NATS server")
+
+        // Start ping timer
+        if let handler = connectionHandler {
+            let interval = TimeAmount(options.pingInterval)
+            handler.startPingTimer(interval: interval)
+        }
+
+        settleHandshake(.success(()))
     }
 
     /// Apply an async INFO frame received after the initial handshake.
