@@ -75,6 +75,22 @@ struct WireParsingTests {
         #expect(headers["A"] == "b")
     }
 
+    @Test("Header names match case-insensitively without allocating, including non-ASCII")
+    func headerNameMatching() {
+        #expect(NatsHeaders.namesMatch("KV-Operation", "kv-operation"))
+        #expect(NatsHeaders.namesMatch("Status", "STATUS"))
+        #expect(!NatsHeaders.namesMatch("Status", "Statu"))
+        #expect(!NatsHeaders.namesMatch("Status", "Stat_s"))
+        #expect(!NatsHeaders.namesMatch("A[", "a{"), "only letters fold")
+        #expect(NatsHeaders.namesMatch("Ünïcode", "üNÏCODE"))
+        var headers = NatsHeaders()
+        headers.append("Nats-Msg-Size", "1")
+        #expect(headers["nats-msg-size"] == "1")
+        headers["NATS-MSG-SIZE"] = "2"
+        #expect(headers.count == 1)
+        #expect(headers["Nats-Msg-Size"] == "2")
+    }
+
     @Test("Ack subject fields")
     func ackSubject() throws {
         let subject = "$JS.ACK.KV_bucket.watcher.2.1234.567.1789615116499918000.42"
